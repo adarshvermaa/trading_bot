@@ -204,6 +204,26 @@ class ScalpingBot:
                     await asyncio.sleep(1)
                     continue
 
+                # Live trading check: Verify if position still exists on Delta Exchange
+                if self.is_live:
+                    is_in_account = bool(self.account_manager and symbol in self.account_manager.positions)
+                    if not is_in_account or int(time.time()) % 3 == 0:
+                        positions = await self.delta_client.get_positions()
+                        reconciled = self.order_manager.sync_exchange_positions(positions, current_price=live_price)
+                        if reconciled or not self.order_manager.active_order:
+                            last_c = self.order_manager.last_closed_order or {}
+                            c_reason = last_c.get("reason", "DELTA_CLOSED")
+                            c_pnl = last_c.get("pnl", 0.0)
+                            logger.info(
+                                f"Live position for {symbol} closed on Delta Exchange: "
+                                f"reason={c_reason}, pnl=${c_pnl:+.2f}. Transitioning monitor loop to idle."
+                            )
+                            self._last_close_reason = f"{c_reason} (${c_pnl:+.2f})"
+                            self._position_health = "--"
+                            cooldown = 5.0 if c_pnl >= 0 else float(self.config.risk.daily_limits.cooldown_seconds)
+                            self._re_entry_cooldown_until = time.time() + cooldown
+                            continue
+
                 # --- 1. Update real-time P&L ---
                 if self.account_manager and symbol in self.account_manager.positions:
                     self.account_manager.update_current_price(symbol, live_price)
@@ -550,10 +570,9 @@ class ScalpingBot:
                         positions = await self.delta_client.get_positions()
                         self.account_manager.update_from_exchange(balances, positions)
                         if isinstance(positions, list):
-                            for p in positions:
-                                pid = p.get("product_id")
-                                sym = p.get("symbol", "")
-                                self.order_manager.sync_from_exchange_position(p, sym, pid)
+                            ao = self.order_manager.active_order
+                            cur_p = self._get_live_price(ao.symbol) if (ao and ao.symbol) else 0.0
+                            self.order_manager.sync_exchange_positions(positions, current_price=cur_p)
 
                     self.risk_manager.delta_connected = True
                     self.risk_manager.delta_error_reason = ""
@@ -758,16 +777,7 @@ class ScalpingBot:
                 "next_trigger": self._monitored_market.get("next_trigger", "CONFLUENCE READY TO EXECUTE"),
             })
         initial_risk = self.risk_manager.get_risk_status()
-        initial_execution: dict[str, Any] = {}
-        ao = getattr(self.order_manager, "active_order", None)
-        if ao:
-            initial_execution = {
-                "order_id": str(ao.order_id or "--"),
-                "order_status": ao.state.value if ao.state else "--",
-                "fill_price": f"${ao.entry_price:,.2f}" if ao.entry_price else "--",
-                "fees": "--",
-                "last_event": getattr(ao, "last_event", "--") or "--",
-            }
+        initial_execution = self.order_manager.get_execution_dict()
 
         self.dashboard.update(
             account_data=initial_account,
@@ -845,16 +855,7 @@ class ScalpingBot:
 
                     risk_data = self.risk_manager.get_risk_status()
 
-                    execution_data: dict[str, Any] = {}
-                    ao = getattr(self.order_manager, "active_order", None)
-                    if ao:
-                        execution_data = {
-                            "order_id": str(ao.order_id or "--"),
-                            "order_status": ao.state.value if ao.state else "--",
-                            "fill_price": f"${ao.entry_price:,.2f}" if ao.entry_price else "--",
-                            "fees": "--",
-                            "last_event": getattr(ao, "last_event", "--") or "--",
-                        }
+                    execution_data = self.order_manager.get_execution_dict()
 
                     self.dashboard.update(
                         account_data=account_data,

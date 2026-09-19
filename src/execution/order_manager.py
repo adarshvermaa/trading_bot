@@ -16,6 +16,7 @@ class OrderState(Enum):
     FILLED = "FILLED"
     CANCELLED = "CANCELLED"
     REJECTED = "REJECTED"
+    CLOSED = "CLOSED"
 
 @dataclass
 class ActiveOrder:
@@ -50,6 +51,7 @@ class OrderManager:
         self.account_manager = account_manager
         self.active_orders: Dict[str, ActiveOrder] = {}
         self.active_client_ids: set[str] = set()
+        self.last_closed_order: Optional[Dict[str, Any]] = None
 
     @property
     def active_order(self) -> Optional[ActiveOrder]:
@@ -77,9 +79,14 @@ class OrderManager:
                 positions = await self.delta_client.get_position(product_id)
             else:
                 positions = await self.delta_client.get_positions()
-            for pos in positions:
-                if abs(float(pos.get("size", 0))) > 0:
-                    return True
+
+            if isinstance(positions, list):
+                if getattr(self.delta_client, "live_trading", False):
+                    self.sync_exchange_positions(positions)
+
+                for pos in positions:
+                    if abs(float(pos.get("size", 0))) > 0:
+                        return True
         except Exception as e:
             logger.warning(f"Error checking exchange positions: {e}")
 
@@ -373,6 +380,8 @@ class OrderManager:
             # Paper mode close
             if product_id:
                 pnl = self.delta_client.close_paper_position(product_id, close_price)
+                if asyncio.iscoroutine(pnl):
+                    pnl = await pnl
             if self.account_manager:
                 self.account_manager.close_paper_position(symbol, close_price, contract_value)
         else:
@@ -387,8 +396,24 @@ class OrderManager:
         self.risk_manager.record_trade_result(pnl)
 
         # Update order state
-        target.state = OrderState.CANCELLED
+        target.state = OrderState.CLOSED
         target.last_event = reason
+
+        self.last_closed_order = {
+            "order_id": target.order_id,
+            "symbol": target.symbol,
+            "side": target.side,
+            "size": target.size,
+            "entry_price": target.entry_price,
+            "exit_price": close_price,
+            "pnl": pnl,
+            "reason": reason,
+            "closed_at": time.time(),
+        }
+
+        # Clear from active tracking
+        self.active_orders.pop(target.order_id, None)
+        self.active_client_ids.discard(target.client_order_id)
 
         logger.info(
             f"Position closed: symbol={symbol}, reason={reason}, pnl={pnl:.2f}, "
@@ -397,10 +422,10 @@ class OrderManager:
         return pnl
 
     def clear_closed_orders(self) -> None:
-        """Remove all cancelled/rejected orders from active tracking."""
+        """Remove all closed/cancelled/rejected orders from active tracking."""
         to_remove = [
             oid for oid, order in self.active_orders.items()
-            if order.state in (OrderState.CANCELLED, OrderState.REJECTED)
+            if order.state in (OrderState.CLOSED, OrderState.CANCELLED, OrderState.REJECTED)
         ]
         for oid in to_remove:
             order = self.active_orders.pop(oid)
@@ -504,4 +529,141 @@ class OrderManager:
             logger.info(f"Order {ao.order_id} confirmed filled via exchange position at {entry_price}")
             return True
         return False
+
+    def sync_exchange_positions(
+        self,
+        live_positions: List[Dict[str, Any]],
+        current_price: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Reconcile active orders against live positions reported by Delta Exchange.
+        1. For any position with size > 0:
+           Promotes matching OPEN active_order to FILLED via sync_from_exchange_position.
+        2. For any FILLED active_order:
+           If no longer present in exchange live_positions, marks it CLOSED,
+           calculates realized P&L, records trade result in RiskManager,
+           stores last_closed_order, and cleans up active tracking so the bot
+           can immediately scan and enter new setups.
+        """
+        if not isinstance(live_positions, list):
+            return []
+
+        active_pids: set[int] = set()
+        active_syms: set[str] = set()
+
+        for p in live_positions:
+            size = abs(float(p.get("size", 0.0)))
+            if size > 0:
+                pid = p.get("product_id")
+                sym = p.get("product_symbol") or p.get("symbol")
+                if pid is not None:
+                    try:
+                        active_pids.add(int(pid))
+                    except (ValueError, TypeError):
+                        pass
+                if sym:
+                    active_syms.add(str(sym).upper())
+                # Ensure any matching OPEN order transitions to FILLED
+                self.sync_from_exchange_position(p, str(sym) if sym else "", int(pid) if pid else 0)
+
+        closed_reconciled: List[Dict[str, Any]] = []
+        for order in list(self.active_orders.values()):
+            if order.state == OrderState.FILLED:
+                is_on_exchange = False
+                if order.product_id is not None and int(order.product_id) in active_pids:
+                    is_on_exchange = True
+                elif order.symbol and str(order.symbol).upper() in active_syms:
+                    is_on_exchange = True
+
+                if not is_on_exchange:
+                    exit_p = current_price if (current_price and current_price > 0) else order.entry_price
+                    cv = 0.001 if "BTC" in order.symbol else (0.01 if "ETH" in order.symbol else 1.0)
+                    if self.account_manager:
+                        cv = self.account_manager.get_contract_value(order.symbol)
+
+                    if order.side.upper() in ("BUY", "LONG"):
+                        pnl = (exit_p - order.entry_price) * order.size * cv
+                    else:
+                        pnl = (order.entry_price - exit_p) * order.size * cv
+
+                    reason = "TP_HIT" if pnl > 0 else ("SL_HIT" if pnl < 0 else "CLOSED_ON_DELTA")
+                    if order.tp_price and exit_p >= order.tp_price and order.side.upper() in ("BUY", "LONG"):
+                        reason = "TP_HIT"
+                    elif order.sl_price and exit_p <= order.sl_price and order.side.upper() in ("BUY", "LONG"):
+                        reason = "SL_HIT"
+                    elif order.tp_price and exit_p <= order.tp_price and order.side.upper() in ("SELL", "SHORT"):
+                        reason = "TP_HIT"
+                    elif order.sl_price and exit_p >= order.sl_price and order.side.upper() in ("SELL", "SHORT"):
+                        reason = "SL_HIT"
+
+                    self.risk_manager.record_trade_result(pnl)
+
+                    pnl_str = f"+${pnl:,.2f}" if pnl >= 0 else f"-${abs(pnl):,.2f}"
+                    order.state = OrderState.CLOSED
+                    order.last_event = f"{reason} ({pnl_str})"
+
+                    self.last_closed_order = {
+                        "order_id": order.order_id,
+                        "symbol": order.symbol,
+                        "side": order.side,
+                        "size": order.size,
+                        "entry_price": order.entry_price,
+                        "exit_price": exit_p,
+                        "pnl": pnl,
+                        "reason": reason,
+                        "closed_at": time.time(),
+                    }
+
+                    self.active_orders.pop(order.order_id, None)
+                    self.active_client_ids.discard(order.client_order_id)
+                    if self.account_manager and order.symbol in self.account_manager.positions:
+                        self.account_manager.positions.pop(order.symbol, None)
+
+                    logger.info(
+                        f"Reconciled closed position for order {order.order_id} ({order.symbol}) on Delta Exchange: "
+                        f"reason={reason}, pnl={pnl:+.2f}, exit_price={exit_p:.2f}"
+                    )
+                    closed_reconciled.append(self.last_closed_order)
+
+        return closed_reconciled
+
+    def get_execution_dict(self) -> Dict[str, Any]:
+        """Return execution panel dictionary for the live dashboard."""
+        ao = self.active_order
+        if ao:
+            return {
+                "order_id": str(ao.order_id or "--"),
+                "order_status": ao.state.value if ao.state else "--",
+                "fill_price": f"${ao.entry_price:,.2f}" if ao.entry_price else "--",
+                "fees": "--",
+                "last_event": getattr(ao, "last_event", "--") or "--",
+            }
+        elif self.last_closed_order:
+            pnl_val = self.last_closed_order.get("pnl", 0.0)
+            if isinstance(pnl_val, (int, float)):
+                pnl_str = f"+${pnl_val:,.2f}" if pnl_val >= 0 else f"-${abs(pnl_val):,.2f}"
+            else:
+                pnl_str = "--"
+            reason = self.last_closed_order.get("reason", "CLOSED")
+            entry_p = self.last_closed_order.get("entry_price", 0.0)
+            exit_p = self.last_closed_order.get("exit_price", 0.0)
+            fill_desc = f"${entry_p:,.2f}" if entry_p > 0 else "--"
+            if exit_p > 0 and exit_p != entry_p:
+                fill_desc += f" -> ${exit_p:,.2f}"
+            return {
+                "order_id": str(self.last_closed_order.get("order_id", "--")),
+                "order_status": "CLOSED (IDLE)",
+                "fill_price": fill_desc,
+                "fees": "--",
+                "last_event": f"{reason} ({pnl_str})",
+            }
+        else:
+            return {
+                "order_id": "--",
+                "order_status": "IDLE (SCANNING)",
+                "fill_price": "--",
+                "fees": "--",
+                "last_event": "WAITING_FOR_SETUP",
+            }
+
 

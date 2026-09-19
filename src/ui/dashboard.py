@@ -295,13 +295,38 @@ class Dashboard:
         table.add_column(style="cyan", justify="left")
         table.add_column(style="white", justify="left")
         
+        status_raw = str(self.execution_data.get('order_status', '--')).upper()
+        if "FILLED" in status_raw:
+            status_text = Text(f": {status_raw}", style="bold green")
+            border_col = "green"
+        elif "OPEN" in status_raw or "PENDING" in status_raw:
+            status_text = Text(f": {status_raw}", style="bold yellow")
+            border_col = "yellow"
+        elif "CLOSED" in status_raw:
+            status_text = Text(f": {status_raw}", style="bold cyan")
+            border_col = "cyan"
+        elif "IDLE" in status_raw:
+            status_text = Text(f": {status_raw}", style="dim cyan")
+            border_col = "blue"
+        else:
+            status_text = Text(f": {status_raw}", style="white")
+            border_col = "cyan"
+
+        last_ev = str(self.execution_data.get('last_event', '--'))
+        if "+" in last_ev or "PROFIT" in last_ev or "TP_HIT" in last_ev:
+            event_text = Text(f": {last_ev}", style="bold green")
+        elif "-" in last_ev or "LOSS" in last_ev or "SL_HIT" in last_ev:
+            event_text = Text(f": {last_ev}", style="bold red")
+        else:
+            event_text = Text(f": {last_ev}", style="white")
+
         table.add_row("Order ID", f": {self.execution_data.get('order_id', '--')}")
-        table.add_row("Status", f": {self.execution_data.get('order_status', '--')}")
+        table.add_row("Status", status_text)
         table.add_row("Fill Price", f": {self.execution_data.get('fill_price', '--')}")
         table.add_row("Fees", f": {self.execution_data.get('fees', '--')}")
-        table.add_row("Last Event", f": {self.execution_data.get('last_event', '--')}")
+        table.add_row("Last Event", event_text)
         
-        return Panel(table, title="EXECUTION", border_style="green")
+        return Panel(table, title="EXECUTION", border_style=border_col)
 
     def render(self) -> Layout:
         layout = Layout()
