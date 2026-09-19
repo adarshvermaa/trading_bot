@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "crypto-scalping-bot"
 version = "0.1.0"
-description = "CLI crypto scalping bot with Binance data + Delta Exchange execution"
+description = "CLI crypto scalping bot with Delta Exchange market data + execution"
 requires-python = ">=3.11"
 dependencies = [
     "websockets>=12.0",

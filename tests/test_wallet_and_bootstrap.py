@@ -1,21 +1,20 @@
 import pytest
 import asyncio
 from unittest.mock import AsyncMock, patch, MagicMock
-from src.data.binance_ws import BinanceWSClient, Candle
+from src.data.delta_ws import DeltaWSClient, Candle
 from src.execution.delta import DeltaExchangeClient
 from src.portfolio.account import AccountManager
 
 
 @pytest.mark.asyncio
-async def test_binance_bootstrap_historical_candles():
-    """Verify bootstrap_historical_candles fetches and stores candles for all timeframes."""
-    symbols = ["btcusdt"]
-    reverse_map = {"BTCUSDT": "BTCUSD"}
-    client = BinanceWSClient(symbols=symbols, binance_to_internal_symbol_map=reverse_map)
+async def test_delta_bootstrap_historical_candles():
+    """Verify bootstrap_historical_candles fetches and stores candles from Delta for all timeframes."""
+    symbols = ["BTCUSD"]
+    client = DeltaWSClient(symbols=symbols)
 
-    # Mock _fetch_symbol_klines to simulate REST response
+    # Mock _fetch_delta_klines to simulate REST response
     fake_candle_count = 100
-    with patch.object(client, "_fetch_symbol_klines", new_callable=AsyncMock) as mock_fetch:
+    with patch.object(client, "_fetch_delta_klines", new_callable=AsyncMock) as mock_fetch:
         mock_fetch.return_value = fake_candle_count
         count = await client.bootstrap_historical_candles(limit=100)
         

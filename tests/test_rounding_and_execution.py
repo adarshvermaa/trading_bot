@@ -118,8 +118,9 @@ async def test_place_order_formats_bracket_prices_with_tick_size():
         call_args = mock_req.call_args
         body = call_args.kwargs["body"]
         
-        # Prices must be string-formatted multiples of tick_size (0.5)
-        assert body["limit_price"] == "64250.5"
+        # Prices must be string-formatted multiples of tick_size (0.5), and market_order omits limit_price
+        assert body["order_type"] == "market_order"
+        assert "limit_price" not in body
         assert body["bracket_stop_loss_price"] == "64000.0"
         assert body["bracket_take_profit_price"] == "64751.0"
         assert body["product_id"] == 27

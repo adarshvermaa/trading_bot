@@ -57,7 +57,8 @@ class RiskManager:
         
         # Failsafe flags
         self.data_stale: bool = False
-        self.binance_connected: bool = True
+        self.market_data_connected: bool = True
+        self.binance_connected: bool = True  # Backward compatibility
         self.delta_connected: bool = True
         self.delta_error_reason: str = ""
         
@@ -306,8 +307,8 @@ class RiskManager:
         failures = []
         if self.data_stale:
             failures.append("STALE_DATA")
-        if not self.binance_connected:
-            failures.append("BINANCE_DISCONNECTED")
+        if not self.market_data_connected:
+            failures.append("MARKET_DATA_DISCONNECTED")
         if not self.delta_connected:
             failures.append(self.delta_error_reason or "DELTA_DISCONNECTED")
             

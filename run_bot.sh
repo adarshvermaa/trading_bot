@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Crypto Scalping Bot — CLI Runner & Management Script
-# Binance Futures Data + Delta Exchange India Futures Execution
+# Delta Exchange Market Data + Futures Execution
 # ==============================================================================
 
 set -e

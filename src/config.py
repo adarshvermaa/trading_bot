@@ -80,9 +80,15 @@ class ScannerConfig(BaseModel):
     score_weights: ScannerWeights = Field(default_factory=ScannerWeights)
 
 
+class ExecutionConfig(BaseModel):
+    order_type: str = "market"
+    unfilled_timeout_seconds: float = 10.0
+    use_orderbook_pricing: bool = True
+    max_slippage_bps: float = 15.0
+
+
 class AssetConfig(BaseModel):
-    universe: list[str] = Field(default_factory=list)
-    binance_symbol_map: dict[str, str] = Field(default_factory=dict)
+    universe: list[str] = Field(default_factory=lambda: ["BTCUSD", "ETHUSD"])
 
 
 class StrategyConfig(BaseModel):
@@ -92,6 +98,7 @@ class StrategyConfig(BaseModel):
     structure: StructureConfig = Field(default_factory=StructureConfig)
     ml: MLConfig = Field(default_factory=MLConfig)
     scanner: ScannerConfig = Field(default_factory=ScannerConfig)
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +180,6 @@ class EnvConfig(BaseModel):
     delta_api_secret: str = ""
     delta_api_url: str = "https://api.india.delta.exchange"
     delta_ws_url: str = "wss://socket.india.delta.exchange"
-    binance_ws_url: str = "wss://stream.binance.com/ws"
     litellm_api_key: str = ""
     litellm_model: str = "gpt-4o-mini"
     live_trading: bool = False
@@ -216,7 +222,6 @@ def load_config(config_dir: pathlib.Path | str | None = None) -> AppConfig:
         delta_api_secret=os.getenv("DELTA_API_SECRET", ""),
         delta_api_url=os.getenv("DELTA_API_URL", "https://api.india.delta.exchange"),
         delta_ws_url=os.getenv("DELTA_WS_URL", "wss://socket.india.delta.exchange"),
-        binance_ws_url=os.getenv("BINANCE_WS_URL", "wss://stream.binance.com/ws"),
         litellm_api_key=os.getenv("LITELLM_API_KEY", ""),
         litellm_model=os.getenv("LITELLM_MODEL", "gpt-4o-mini"),
         live_trading=os.getenv("LIVE_TRADING", "false"),

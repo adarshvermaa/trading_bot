@@ -179,6 +179,7 @@ class OrderManager:
             margin = computed_margin
             notional = computed_notional
         else:
+            size = float(max(1, int(round(size))))
             notional = size * contract_val * price
             margin = notional / leverage
 
@@ -226,6 +227,9 @@ class OrderManager:
             logger.error(f"Trade rejected by RiskManager: {reason}")
             return None
 
+        # Force market order only on Delta Exchange - limit orders are removed
+        chosen_order_type = "market_order"
+
         # Log details
         account_pnl = 0.0
         leveraged_pnl = 0.0
@@ -242,40 +246,50 @@ class OrderManager:
                 product_id=product_id,
                 side=delta_side,
                 size=size,
-                order_type="limit",
-                limit_price=price,
+                order_type="market_order",
+                limit_price=None,
                 bracket_stop_loss_price=final_sl,
                 bracket_take_profit_price=final_tp,
                 client_order_id=client_order_id,
                 tick_size=tick_size,
+                symbol=symbol,
+                market_price=price,
             )
 
             order_id = str(order_res.get("id")) if order_res else None
+            res_state = str(order_res.get("state") or order_res.get("status") or "").lower()
+            is_filled = res_state in ("filled", "closed") or not self.delta_client.live_trading
+            raw_fill = order_res.get("average_fill_price") or order_res.get("fill_price")
+            fill_p = float(raw_fill) if (raw_fill and float(raw_fill) > 0) else price
+
             if order_id:
                 active_order = ActiveOrder(
                     order_id=order_id,
                     client_order_id=client_order_id,
-                    state=OrderState.OPEN if self.delta_client.live_trading else OrderState.FILLED,
+                    state=OrderState.FILLED if is_filled else OrderState.OPEN,
                     symbol=symbol,
                     side=side.upper(),
                     size=size,
-                    entry_price=price,
+                    entry_price=fill_p if is_filled else price,
                     sl_price=final_sl,
                     tp_price=final_tp,
                     product_id=product_id,
-                    last_event="ORDER_PLACED",
+                    last_event="ORDER_FILLED" if is_filled else "ORDER_PLACED",
+                    created_at=time.time(),
                 )
                 self.active_orders[order_id] = active_order
 
-                if not self.delta_client.live_trading and self.account_manager:
+                if is_filled and self.account_manager:
+                    actual_notional = size * contract_val * fill_p
+                    actual_margin = actual_notional / float(leverage)
                     self.account_manager.update_paper_position(
                         symbol=symbol,
                         side=side.upper(),
                         size=int(size) if size >= 1 else 1,
-                        price=price,
+                        price=fill_p,
                         leverage=int(leverage),
-                        margin=margin,
-                        notional=notional,
+                        margin=actual_margin,
+                        notional=actual_notional,
                         sl=final_sl,
                         tp=final_tp,
                     )
@@ -393,3 +407,101 @@ class OrderManager:
             self.active_client_ids.discard(order.client_order_id)
         if to_remove:
             logger.info(f"Cleared {len(to_remove)} closed orders from active tracking")
+
+    async def sync_order_status(self, order_id: Optional[str] = None) -> Optional[ActiveOrder]:
+        """Poll Delta Exchange for order execution state and transition OPEN -> FILLED or CANCELLED."""
+        if not self.delta_client.live_trading:
+            return self.active_order
+
+        target_order = None
+        if order_id and order_id in self.active_orders:
+            target_order = self.active_orders[order_id]
+        else:
+            target_order = self.active_order
+
+        if not target_order or target_order.state != OrderState.OPEN:
+            return target_order
+
+        try:
+            res = await self.delta_client.get_order(target_order.order_id)
+            if not res:
+                return target_order
+
+            exchange_state = str(res.get("state") or "").lower()
+            if exchange_state == "filled":
+                raw_fill = res.get("average_fill_price") or res.get("fill_price")
+                fill_price = float(raw_fill) if (raw_fill and float(raw_fill) > 0) else target_order.entry_price
+                target_order.state = OrderState.FILLED
+                target_order.entry_price = fill_price
+                target_order.last_event = "ORDER_FILLED"
+                logger.info(f"Order {target_order.order_id} filled at {fill_price:.2f} on Delta Exchange")
+
+                if self.account_manager:
+                    product = await self.delta_client.get_product(target_order.symbol)
+                    cv = float(product.get("contract_value", 1.0)) if product else 1.0
+                    max_lev = float(product.get("max_leverage", 150.0)) if product else 150.0
+                    notional = target_order.size * cv * fill_price
+                    margin = notional / max_lev
+                    self.account_manager.update_paper_position(
+                        symbol=target_order.symbol,
+                        side=target_order.side,
+                        size=int(target_order.size) if target_order.size >= 1 else 1,
+                        price=fill_price,
+                        leverage=int(max_lev),
+                        margin=margin,
+                        notional=notional,
+                        sl=target_order.sl_price,
+                        tp=target_order.tp_price,
+                    )
+            elif exchange_state in ("cancelled", "rejected", "closed"):
+                target_order.state = OrderState.CANCELLED
+                target_order.last_event = f"ORDER_{exchange_state.upper()}"
+                logger.info(f"Order {target_order.order_id} {exchange_state} on Delta Exchange")
+                self.active_client_ids.discard(target_order.client_order_id)
+                self.active_orders.pop(target_order.order_id, None)
+
+        except Exception as e:
+            logger.debug(f"Error syncing order {target_order.order_id} status: {e}")
+
+        return target_order
+
+    async def check_unfilled_timeouts(self, timeout_seconds: float = 10.0) -> List[str]:
+        """Cancel orders that remain in OPEN state for longer than timeout_seconds."""
+        now = time.time()
+        cancelled_ids = []
+        for order in list(self.active_orders.values()):
+            if order.state == OrderState.OPEN:
+                age = now - getattr(order, "created_at", now)
+                if age >= timeout_seconds:
+                    logger.warning(
+                        f"Order {order.order_id} unfilled after {age:.1f}s (timeout={timeout_seconds}s). Cancelling order on Delta..."
+                    )
+                    try:
+                        await self.delta_client.cancel_order(order.order_id, order.product_id)
+                    except Exception as e:
+                        logger.warning(f"Failed to cancel timed-out order {order.order_id}: {e}")
+
+                    order.state = OrderState.CANCELLED
+                    order.last_event = "ORDER_TIMED_OUT"
+                    self.active_client_ids.discard(order.client_order_id)
+                    self.active_orders.pop(order.order_id, None)
+                    cancelled_ids.append(order.order_id)
+        return cancelled_ids
+
+    def sync_from_exchange_position(self, exchange_pos: Dict[str, Any], symbol: str, product_id: int) -> bool:
+        """If exchange reports an active position, ensure matching active_order is FILLED."""
+        size = abs(float(exchange_pos.get("size", 0.0)))
+        if size <= 0:
+            return False
+
+        entry_price = float(exchange_pos.get("entry_price", 0.0))
+        ao = self.active_order
+        if ao and ao.state == OrderState.OPEN and (ao.product_id == product_id or ao.symbol == symbol):
+            ao.state = OrderState.FILLED
+            if entry_price > 0:
+                ao.entry_price = entry_price
+            ao.last_event = "EXCHANGE_POSITION_CONFIRMED"
+            logger.info(f"Order {ao.order_id} confirmed filled via exchange position at {entry_price}")
+            return True
+        return False
+

@@ -2,7 +2,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from src.execution.delta import DeltaExchangeClient, DeltaAPIError
 from src.execution.order_manager import OrderManager, OrderState
-from src.data.binance_ws import BinanceWSClient
+from src.data.delta_ws import DeltaWSClient
 from src.config import load_config
 
 
@@ -179,39 +179,25 @@ async def test_order_manager_accepts_futures():
     delta_mock.place_order.assert_called_once()
 
 
-def test_binance_futures_ws_url_and_stream_construction():
-    """Verify BinanceWSClient connects to Binance Futures stream with all 10 universe assets."""
-    symbols = [
-        "btcusdt", "ethusdt", "xautusdt", "paxgusdt", "solusdt",
-        "xrpusdt", "bnbusdt", "dogeusdt", "trxusdt", "hypeusdt"
-    ]
-    client = BinanceWSClient(
-        symbols=symbols,
-        binance_to_internal_symbol_map={},
-        ws_url="wss://fstream.binance.com/stream"
-    )
-    
-    url = client._get_stream_url()
-    assert url.startswith("wss://fstream.binance.com/stream?streams=")
-    
-    # Verify streams contain 1m, 5m, 15m for every universe asset
-    for s in symbols:
-        assert f"{s}@kline_1m" in url
-        assert f"{s}@kline_5m" in url
-        assert f"{s}@kline_15m" in url
+def test_delta_ws_subscription_payload():
+    """Verify DeltaWSClient builds correct subscription payload for BTCUSD & ETHUSD."""
+    client = DeltaWSClient(["BTCUSD", "ETHUSD"])
+    payload = client._build_subscription_payload()
+    assert payload["type"] == "subscribe"
+    channels = payload["payload"]["channels"]
+    ch_names = {c["name"] for c in channels}
+    assert "candlestick_1m" in ch_names
+    assert "candlestick_5m" in ch_names
+    assert "candlestick_15m" in ch_names
+    assert "v2/ticker" in ch_names
+    for c in channels:
+        assert c["symbols"] == ["BTCUSD", "ETHUSD"]
 
 
-def test_strategy_universe_all_ten_assets_mapped():
-    """Verify strategy.yaml config contains all 10 assets with 1:1 futures mappings."""
+def test_strategy_universe_assets():
+    """Verify strategy.yaml config contains BTCUSD and ETHUSD."""
     config = load_config()
     universe = config.strategy.assets.universe
-    binance_map = config.strategy.assets.binance_symbol_map
-    
     expected_assets = ["BTCUSD", "ETHUSD"]
-    
     assert universe == expected_assets
     assert len(universe) == 2
-    
-    for asset in expected_assets:
-        assert asset in binance_map
-        assert binance_map[asset].endswith("usdt")

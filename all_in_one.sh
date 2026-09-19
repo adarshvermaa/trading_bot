@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # ALL-IN-ONE CRYPTO FUTURES SCALPING BOT MASTER SCRIPT
-# Binance Futures Data Feed + Delta Exchange India Futures Execution
+# Delta Exchange Market Data + Futures Execution
 # ==============================================================================
 
 set -eo pipefail
@@ -44,7 +44,7 @@ print_banner() {
     clear 2>/dev/null || true
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║${BOLD}${GREEN}          ALL-IN-ONE CRYPTO FUTURES SCALPING BOT MASTER CLI                ${NC}${CYAN}║${NC}"
-    echo -e "${CYAN}║${DIM}   Binance Futures (Market Data) + Delta Exchange India (Futures Exec)     ${NC}${CYAN}║${NC}"
+    echo -e "${CYAN}║${DIM}   Delta Exchange India (Market Data + Futures Execution)                   ${NC}${CYAN}║${NC}"
     echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -64,7 +64,6 @@ DELTA_API_KEY=
 DELTA_API_SECRET=
 DELTA_API_URL=https://api.india.delta.exchange
 DELTA_WS_URL=wss://socket.india.delta.exchange
-BINANCE_WS_URL=wss://stream.binance.com/ws
 LITELLM_API_KEY=
 LITELLM_MODEL=gpt-4o-mini
 LIVE_TRADING=false
@@ -244,7 +243,7 @@ interactive_menu() {
         echo -e "  ${GREEN}2)${NC} ${BOLD}Run PAPER Trading Mode${NC}          ${CYAN}[$10,000 virtual balance simulation]${NC}"
         echo -e "  ${GREEN}3)${NC} ${BOLD}One-Shot Market Scanner${NC}         ${YELLOW}[Bootstraps 3000 candles & scans universe]${NC}"
         echo -e "  ${GREEN}4)${NC} ${BOLD}Check Account Balance & Status${NC}  ${BLUE}[Live wallet equity & active positions]${NC}"
-        echo -e "  ${GREEN}5)${NC} ${BOLD}Verify Delta & Binance APIs${NC}     ${MAGENTA}[Validates 10 assets, tick rounding, wallet]${NC}"
+        echo -e "  ${GREEN}5)${NC} ${BOLD}Verify Delta Exchange API${NC}       ${MAGENTA}[Validates BTC & ETH, tick rounding, wallet]${NC}"
         echo -e "  ${GREEN}6)${NC} ${BOLD}Run Automated Test Suite${NC}        ${CYAN}[48 Pytest unit & integration tests]${NC}"
         echo -e "  ${GREEN}7)${NC} ${BOLD}Configure API Credentials (.env)${NC}"
         echo -e "  ${GREEN}8)${NC} ${BOLD}Emergency Kill Switch / Stop${NC}    ${RED}[Terminates bot processes]${NC}"

@@ -19,7 +19,7 @@ from typing import Any
 
 from src.cli import parse_args
 from src.config import load_config, AppConfig
-from src.data.binance_ws import BinanceWSClient, CandleStore, Candle
+from src.data.delta_ws import DeltaWSClient, CandleStore, Candle
 from src.execution.delta import DeltaExchangeClient
 from src.execution.order_manager import OrderManager, OrderState
 from src.strategy.structure import MarketStructure
@@ -45,25 +45,18 @@ class ScalpingBot:
         self.is_live = (mode == "live" or (mode == "status" and config.env.live_trading)) and config.env.live_trading
         self._shutdown = asyncio.Event()
 
-        # ---- Data layer ----
-        binance_map = config.strategy.assets.binance_symbol_map
-        # Build reverse map: binance_symbol -> delta_symbol
-        reverse_map: dict[str, str] = {}
-        binance_symbols: list[str] = []
-        for delta_sym, binance_sym in binance_map.items():
-            reverse_map[binance_sym] = delta_sym
-            if binance_sym not in binance_symbols:
-                binance_symbols.append(binance_sym)
-
-        self.candle_store = CandleStore(max_len=200)
-        self.binance_ws = BinanceWSClient(
-            symbols=binance_symbols,
-            binance_to_internal_symbol_map=reverse_map,
+        # ---- Data layer (Delta Exchange WebSocket & CandleStore) ----
+        target_symbols = ["BTCUSD", "ETHUSD"]
+        self.delta_ws = DeltaWSClient(
+            symbols=target_symbols,
+            ws_url=config.env.delta_ws_url,
+            rest_url=config.env.delta_api_url,
             stale_data_seconds=config.risk.failsafe.stale_data_seconds,
-            ws_url=config.env.binance_ws_url,
             max_retries=config.risk.failsafe.reconnect_max_retries,
             backoff_base=config.risk.failsafe.reconnect_backoff_base,
         )
+        self.candle_store = self.delta_ws.candle_store
+        self.binance_ws = self.delta_ws  # Backward compatibility alias
 
         # ---- Execution layer ----
         self.delta_client = DeltaExchangeClient(
@@ -133,7 +126,7 @@ class ScalpingBot:
             "onnx_confidence": "--",
             "llm_status": self.llm_advisor.get_status(),
             "signal_score": "WARMING UP",
-            "next_trigger": "Pre-seeding candles from Binance...",
+            "next_trigger": "Pre-seeding candles from Delta Exchange...",
         }
 
     # ------------------------------------------------------------------
@@ -148,40 +141,32 @@ class ScalpingBot:
     # Data feed
     # ------------------------------------------------------------------
 
-    async def _run_binance(self) -> None:
-        """Run the Binance WebSocket feed."""
+    async def _run_delta_ws(self) -> None:
+        """Run the Delta Exchange WebSocket feed."""
         try:
-            await self.binance_ws.run()
+            await self.delta_ws.run()
         except asyncio.CancelledError:
-            logger.info("Binance WS task cancelled")
+            logger.info("Delta WS task cancelled")
         except Exception:
-            logger.exception("Binance WS fatal error")
+            logger.exception("Delta WS fatal error")
+
+    # Backward compatibility alias
+    async def _run_binance(self) -> None:
+        await self._run_delta_ws()
 
     # ------------------------------------------------------------------
     # Live price helper
     # ------------------------------------------------------------------
 
-    def _get_live_price(self, symbol: str, prefer_delta: bool = False) -> float:
-        """Get the latest real-time price for a symbol.
-        If prefer_delta is True, checks Delta Exchange's genuine futures ticker first.
-        """
-        if prefer_delta:
-            delta_p = self.delta_client.get_latest_price(symbol)
-            if delta_p and delta_p > 0:
-                return delta_p
-
-        p = self.binance_ws.get_latest_price(symbol)
+    def _get_live_price(self, symbol: str, prefer_delta: bool = True) -> float:
+        """Get the latest real-time price for a symbol from Delta Exchange."""
+        p = self.delta_ws.get_latest_price(symbol)
         if p and p > 0:
             return p
-        binance_sym = self.config.strategy.assets.binance_symbol_map.get(symbol, "")
-        if binance_sym:
-            p = self.binance_ws.get_latest_price(binance_sym)
-            if p and p > 0:
-                return p
         delta_p = self.delta_client.get_latest_price(symbol)
         if delta_p and delta_p > 0:
             return delta_p
-        candles_1m = self.binance_ws.candle_store.get_candles(binance_sym or symbol, "1m")
+        candles_1m = self.delta_ws.candle_store.get_candles(symbol.upper(), "1m")
         if candles_1m:
             return candles_1m[-1].close
         return 0.0
@@ -198,8 +183,18 @@ class ScalpingBot:
             try:
                 active = self.order_manager.active_order
                 if not active or active.state != OrderState.FILLED:
+                    # Watchdog: If an order is in OPEN state, sync status or cancel on timeout
+                    if active and active.state == OrderState.OPEN:
+                        await self.order_manager.sync_order_status(active.order_id)
+                        exec_cfg = getattr(getattr(self.config, "strategy", None), "execution", None)
+                        unfilled_timeout = getattr(exec_cfg, "unfilled_timeout_seconds", 10.0) if exec_cfg else 10.0
+                        cancelled = await self.order_manager.check_unfilled_timeouts(unfilled_timeout)
+                        if cancelled:
+                            self._position_health = "--"
+                            self._last_close_reason = "UNFILLED_TIMEOUT"
                     await asyncio.sleep(1)
                     continue
+
 
                 symbol = active.symbol
                 product_id = active.product_id
@@ -258,7 +253,7 @@ class ScalpingBot:
                     )
                     if updated:
                         self.order_manager.update_active_sl(new_sl)
-                        await self.delta_client.update_bracket_stop_loss(product_id, new_sl, tick_size)
+                        await self.delta_client.update_bracket_stop_loss(product_id, new_sl, tick_size, order_id=active.order_id)
                         logger.info(f"[TRAILING SL] {symbol}: {msg}")
 
                 # --- 2. Check paper SL/TP triggers ---
@@ -295,9 +290,8 @@ class ScalpingBot:
 
                 # --- 3. Evaluate position health (every 5 seconds) ---
                 if int(time.time()) % 5 == 0:
-                    binance_sym = self.config.strategy.assets.binance_symbol_map.get(symbol, "")
-                    candles_1m = self.binance_ws.candle_store.get_candles(binance_sym, "1m")
-                    candles_5m = self.binance_ws.candle_store.get_candles(binance_sym, "5m")
+                    candles_1m = self.delta_ws.candle_store.get_candles(symbol, "1m")
+                    candles_5m = self.delta_ws.candle_store.get_candles(symbol, "5m")
 
                     if len(candles_1m) >= 20 and len(candles_5m) >= 3:
                         health, reason = self.signal_generator.evaluate_position_health(
@@ -347,7 +341,6 @@ class ScalpingBot:
     async def _scan_assets(self) -> dict[str, Any] | None:
         """Scan all universe assets (BTC and ETH), rank them, and return the best actionable setup."""
         universe = self.config.strategy.assets.universe
-        binance_map = self.config.strategy.assets.binance_symbol_map
         weights = self.config.strategy.scanner.score_weights
 
         evaluations: list[dict[str, Any]] = []
@@ -365,13 +358,9 @@ class ScalpingBot:
         from src.strategy.signals import compute_atr, compute_adx, compute_vwap
 
         for symbol in universe:
-            binance_sym = binance_map.get(symbol)
-            if not binance_sym:
-                continue
-
-            candles_15m = self.binance_ws.candle_store.get_candles(binance_sym, "15m")
-            candles_5m = self.binance_ws.candle_store.get_candles(binance_sym, "5m")
-            candles_1m = self.binance_ws.candle_store.get_candles(binance_sym, "1m")
+            candles_15m = self.delta_ws.candle_store.get_candles(symbol, "15m")
+            candles_5m = self.delta_ws.candle_store.get_candles(symbol, "5m")
+            candles_1m = self.delta_ws.candle_store.get_candles(symbol, "1m")
 
             if len(candles_15m) < 50 or len(candles_5m) < 50 or len(candles_1m) < 50:
                 continue
@@ -543,16 +532,16 @@ class ScalpingBot:
                 # Wait for a new closed candle
                 try:
                     await asyncio.wait_for(
-                        self.binance_ws.new_candle_event.wait(),
+                        self.delta_ws.new_candle_event.wait(),
                         timeout=5.0,
                     )
-                    self.binance_ws.new_candle_event.clear()
+                    self.delta_ws.new_candle_event.clear()
                 except asyncio.TimeoutError:
                     pass  # Just re-check conditions
 
                 # Update risk manager connection status
-                self.risk_manager.binance_connected = self.binance_ws.is_connected or (not self.binance_ws.is_stale)
-                self.risk_manager.data_stale = self.binance_ws.is_stale
+                self.risk_manager.market_data_connected = self.delta_ws.is_connected or (not self.delta_ws.is_stale)
+                self.risk_manager.data_stale = self.delta_ws.is_stale
 
                 # Update account from exchange
                 try:
@@ -560,6 +549,12 @@ class ScalpingBot:
                         balances = await self.delta_client.get_wallet_balances()
                         positions = await self.delta_client.get_positions()
                         self.account_manager.update_from_exchange(balances, positions)
+                        if isinstance(positions, list):
+                            for p in positions:
+                                pid = p.get("product_id")
+                                sym = p.get("symbol", "")
+                                self.order_manager.sync_from_exchange_position(p, sym, pid)
+
                     self.risk_manager.delta_connected = True
                     self.risk_manager.delta_error_reason = ""
                 except Exception as e:
@@ -582,12 +577,9 @@ class ScalpingBot:
                     # ===== MODE B: Active Position — Structure Monitoring =====
                     active = self.order_manager.active_order
                     if active and active.state == OrderState.FILLED:
-                        binance_sym = self.config.strategy.assets.binance_symbol_map.get(
-                            active.symbol, ""
-                        )
-                        candles_5m = self.binance_ws.candle_store.get_candles(binance_sym, "5m")
-                        candles_1m = self.binance_ws.candle_store.get_candles(binance_sym, "1m")
-                        candles_15m = self.binance_ws.candle_store.get_candles(binance_sym, "15m")
+                        candles_5m = self.delta_ws.candle_store.get_candles(active.symbol, "5m")
+                        candles_1m = self.delta_ws.candle_store.get_candles(active.symbol, "1m")
+                        candles_15m = self.delta_ws.candle_store.get_candles(active.symbol, "15m")
 
                         if len(candles_15m) >= 50 and len(candles_5m) >= 50 and len(candles_1m) >= 50:
                             def to_arr(cc: list) -> dict:
@@ -619,7 +611,12 @@ class ScalpingBot:
                                 sig = self.signal_generator.generate(
                                     to_arr(candles_15m), to_arr(candles_5m), a1m, struct
                                 )
+                                btc_live = self._get_live_price("BTCUSD")
+                                eth_live = self._get_live_price("ETHUSD")
                                 self._monitored_market = {
+                                    "btc_price": btc_live,
+                                    "eth_price": eth_live,
+                                    "rankings": self._monitored_market.get("rankings", "#1 BTCUSD | #2 ETHUSD"),
                                     "15m_bias": f"[{active.symbol}] {struct.bias_15m}",
                                     "5m_bos_choch": f"BOS={struct.bos_5m} CHoCH={struct.choch_5m}",
                                     "liquidity_sweep": str(struct.liquidity_sweep_5m),
@@ -632,6 +629,7 @@ class ScalpingBot:
                                     "llm_status": self.llm_advisor.get_status(),
                                     "signal_score": f"MONITORING ({self._position_health})",
                                 }
+
 
                                 if not struct.is_valid:
                                     logger.warning(
@@ -689,8 +687,12 @@ class ScalpingBot:
                         )
 
                         # Attempt to place order via OrderManager (handles 9-step validation)
-                        delta_live_price = self._get_live_price(setup["symbol"], prefer_delta=True)
+                        delta_live_price = await self.delta_client.fetch_ticker_price(setup["symbol"])
+                        if not delta_live_price or delta_live_price <= 0:
+                            delta_live_price = self._get_live_price(setup["symbol"], prefer_delta=True)
                         exec_price = delta_live_price if delta_live_price > 0 else setup["signal"].entry_price
+                        exec_cfg = getattr(getattr(self.config, "strategy", None), "execution", None)
+                        chosen_order_type = getattr(exec_cfg, "order_type", "market") if exec_cfg else "market"
                         try:
                             await self.order_manager.validate_and_place_order(
                                 symbol=setup["symbol"],
@@ -701,7 +703,9 @@ class ScalpingBot:
                                 atr=setup["atr"],
                                 spread_bps=0.0,
                                 equity=self.account_manager.equity,
+                                order_type=chosen_order_type,
                             )
+
                             self._position_health = "STRONG"
                         except Exception:
                             logger.exception(
@@ -781,12 +785,20 @@ class ScalpingBot:
                     account_data = self.account_manager.to_dashboard_dict()
                     position_data = self.account_manager.get_position_dict()
 
-                    # Add S/R levels and health to position data
+                    # Add S/R levels, health, and fallback order fields to position data
                     if position_data:
                         position_data["nearest_support"] = self._nearest_support
                         position_data["nearest_resistance"] = self._nearest_resistance
                         position_data["health"] = self._position_health
                         position_data["health_reason"] = self._position_health_reason
+                        ao = getattr(self.order_manager, "active_order", None)
+                        if ao:
+                            if not position_data.get("sl") or position_data.get("sl") == 0:
+                                position_data["sl"] = ao.sl_price
+                            if not position_data.get("tp") or position_data.get("tp") == 0:
+                                position_data["tp"] = ao.tp_price
+                            if not position_data.get("leverage") or position_data.get("leverage") <= 1:
+                                position_data["leverage"] = self.config.risk.leverage.high_leverage_value
 
                     # Signal data: use monitored_market (updated by strategy loop during position)
                     signal_data = dict(self._monitored_market) if self._monitored_market else {}
@@ -794,14 +806,19 @@ class ScalpingBot:
                     # Continuously refresh real-time prices on every tick
                     btc_p = self._get_live_price("BTCUSD")
                     eth_p = self._get_live_price("ETHUSD")
+                    btc_delta = self.delta_client.get_latest_price("BTCUSD") or btc_p
+                    eth_delta = self.delta_client.get_latest_price("ETHUSD") or eth_p
                     if btc_p > 0:
                         signal_data["btc_price"] = btc_p
                         if "BTCUSD" in self._market_watch.get("assets", {}):
                             self._market_watch["assets"]["BTCUSD"]["price"] = btc_p
+                            self._market_watch["assets"]["BTCUSD"]["delta_price"] = btc_delta
                     if eth_p > 0:
                         signal_data["eth_price"] = eth_p
                         if "ETHUSD" in self._market_watch.get("assets", {}):
                             self._market_watch["assets"]["ETHUSD"]["price"] = eth_p
+                            self._market_watch["assets"]["ETHUSD"]["delta_price"] = eth_delta
+
 
                     if self._best_signal and not self.order_manager.active_order:
                         sig = self._best_signal["signal"]
@@ -876,12 +893,20 @@ class ScalpingBot:
         self.risk_manager.reset_daily()
 
         # Pre-seed historical market data for immediate strategy execution
-        logger.info("Pre-seeding historical market data from Binance Futures...")
+        logger.info("Pre-seeding historical market data from Delta Exchange...")
         try:
-            bootstrapped = await self.binance_ws.bootstrap_historical_candles(limit=100)
+            bootstrapped = await self.delta_ws.bootstrap_historical_candles(limit=100)
             logger.info(f"Market data bootstrapped: {bootstrapped} candles loaded.")
         except Exception as e:
             logger.warning(f"Candle bootstrapping issue: {e}")
+
+        # Fetch official Delta product specifications for BTC and ETH only
+        logger.info("Fetching Delta Exchange product specifications for BTC and ETH...")
+        try:
+            delta_prods = await self.delta_client.fetch_target_products(["BTCUSD", "ETHUSD"])
+            logger.info(f"Delta products loaded: {list(delta_prods.keys())}")
+        except Exception as e:
+            logger.warning(f"Delta product bootstrap note: {e}")
 
         # Initial account balance and positions fetch
         if self.is_live:
@@ -924,7 +949,7 @@ class ScalpingBot:
 
         if self.mode in ("paper", "live"):
             tasks.append(asyncio.create_task(self.delta_client.run_public_ticker(["BTCUSD", "ETHUSD"])))
-            tasks.append(asyncio.create_task(self._run_binance()))
+            tasks.append(asyncio.create_task(self._run_delta_ws()))
             tasks.append(asyncio.create_task(self._strategy_loop()))
             tasks.append(asyncio.create_task(self._position_monitor_loop()))
             tasks.append(asyncio.create_task(self._dashboard_loop()))
@@ -983,7 +1008,7 @@ class ScalpingBot:
 
         # Cleanup clients
         try:
-            await self.binance_ws.stop()
+            await self.delta_ws.stop()
         except Exception:
             pass
         try:

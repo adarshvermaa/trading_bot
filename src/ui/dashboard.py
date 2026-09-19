@@ -81,14 +81,10 @@ class Dashboard:
 
         # BTC Live Stats
         btc_delta = btc.get("delta_price") or btc.get("price") or self.signal_data.get("btc_price", 0.0)
-        btc_binance = btc.get("price") or self.signal_data.get("btc_price", 0.0)
         btc_delta_str = f"${btc_delta:,.2f}" if (isinstance(btc_delta, (int, float)) and btc_delta > 0) else "--"
         btc_bias = btc.get("bias_15m") or "--"
         btc_bias_col = "green" if btc_bias == "BULLISH" else ("red" if btc_bias == "BEARISH" else "yellow")
-        if isinstance(btc_delta, (int, float)) and isinstance(btc_binance, (int, float)) and btc_delta > 0 and btc_binance > 0 and abs(btc_delta - btc_binance) > 0.01:
-            table.add_row("BTC/USD Delta", Text(f": {btc_delta_str}", style="bold green") + Text(f" (Binance: ${btc_binance:,.2f})", style="dim white"))
-        else:
-            table.add_row("BTC/USD Live", Text(f": {btc_delta_str}", style="bold green"))
+        table.add_row("BTC/USD Live", Text(f": {btc_delta_str}", style="bold green"))
 
         btc_s = btc.get("support", 0.0)
         btc_r = btc.get("resistance", 0.0)
@@ -105,14 +101,10 @@ class Dashboard:
 
         # ETH Live Stats
         eth_delta = eth.get("delta_price") or eth.get("price") or self.signal_data.get("eth_price", 0.0)
-        eth_binance = eth.get("price") or self.signal_data.get("eth_price", 0.0)
         eth_delta_str = f"${eth_delta:,.2f}" if (isinstance(eth_delta, (int, float)) and eth_delta > 0) else "--"
         eth_bias = eth.get("bias_15m") or "--"
         eth_bias_col = "green" if eth_bias == "BULLISH" else ("red" if eth_bias == "BEARISH" else "yellow")
-        if isinstance(eth_delta, (int, float)) and isinstance(eth_binance, (int, float)) and eth_delta > 0 and eth_binance > 0 and abs(eth_delta - eth_binance) > 0.01:
-            table.add_row("ETH/USD Delta", Text(f": {eth_delta_str}", style="bold green") + Text(f" (Binance: ${eth_binance:,.2f})", style="dim white"))
-        else:
-            table.add_row("ETH/USD Live", Text(f": {eth_delta_str}", style="bold green"))
+        table.add_row("ETH/USD Live", Text(f": {eth_delta_str}", style="bold green"))
 
         eth_s = eth.get("support", 0.0)
         eth_r = eth.get("resistance", 0.0)
@@ -151,29 +143,42 @@ class Dashboard:
         table.add_column(style="cyan", justify="left")
         table.add_column(style="white", justify="left")
         
-        table.add_row("Symbol", f": {self.position_data.get('symbol', '--')}")
+        sym = self.position_data.get('symbol', '--')
+        table.add_row("Symbol", f": {sym}")
         table.add_row("Side", f": {self.position_data.get('side', '--')}")
         
         entry = self.position_data.get('entry', '--')
-        table.add_row("Entry", f": ${entry:,.2f}" if isinstance(entry, (int, float)) else f": {entry}")
+        entry_val = entry if isinstance(entry, (int, float)) else 0.0
+        table.add_row("Entry", f": ${entry_val:,.2f}" if entry_val > 0 else f": {entry}")
         
         cur = self.position_data.get('current_price', '--')
-        table.add_row("Current", f": ${cur:,.2f}" if isinstance(cur, (int, float)) else f": {cur}")
+        cur_val = cur if isinstance(cur, (int, float)) else entry_val
+        table.add_row("Current", f": ${cur_val:,.2f}" if cur_val > 0 else f": {cur}")
         
         lev = self.position_data.get('leverage')
-        table.add_row("Leverage", f": {lev}x" if lev else ": --")
+        lev_val = int(lev) if (isinstance(lev, (int, float)) and lev > 1) else 150
+        table.add_row("Leverage", f": {lev_val}x")
         
         margin = self.position_data.get('margin', '--')
-        table.add_row("Margin", f": ${margin:,.2f}" if isinstance(margin, (int, float)) else f": {margin}")
+        margin_val = margin if isinstance(margin, (int, float)) else 0.0
+        table.add_row("Margin", f": ${margin_val:,.2f}" if margin_val > 0 else f": {margin}")
         
-        notional = self.position_data.get('notional', '--')
-        table.add_row("Notional", f": ${notional:,.2f}" if isinstance(notional, (int, float)) else f": {notional}")
+        notional = self.position_data.get('notional', 0.0)
+        notional_val = notional if isinstance(notional, (int, float)) else 0.0
+        if notional_val <= 0.0 and margin_val > 0:
+            notional_val = margin_val * lev_val
+        table.add_row("Notional", f": ${notional_val:,.2f}" if notional_val > 0 else ": --")
         
-        sl = self.position_data.get('sl', '--')
-        sl_str = f"${sl:,.2f}" if isinstance(sl, (int, float)) else f"{sl}"
-        if isinstance(sl, (int, float)) and isinstance(entry, (int, float)) and entry > 0:
+        sl = self.position_data.get('sl', 0.0)
+        sl_val = sl if isinstance(sl, (int, float)) else 0.0
+        if sl_val <= 0.0 and entry_val > 0:
             is_long = str(self.position_data.get('side', '')).upper() in ('BUY', 'LONG')
-            if (is_long and sl > entry) or (not is_long and sl < entry):
+            sl_val = entry_val * (1.0 - 0.03 / lev_val) if is_long else entry_val * (1.0 + 0.03 / lev_val)
+        
+        sl_str = f"${sl_val:,.2f}" if sl_val > 0 else "--"
+        if sl_val > 0 and entry_val > 0:
+            is_long = str(self.position_data.get('side', '')).upper() in ('BUY', 'LONG')
+            if (is_long and sl_val > entry_val) or (not is_long and sl_val < entry_val):
                 table.add_row("SL (Trailed)", Text(f": {sl_str} (Profit Locked)", style="bold green"))
             else:
                 table.add_row("SL", f": {sl_str}")
@@ -181,7 +186,7 @@ class Dashboard:
             table.add_row("SL", f": {sl_str}")
         
         tp = self.position_data.get('tp', '--')
-        table.add_row("TP", f": {tp} (Dynamic Trailing)" if tp == '--' or tp == 0 else (f": ${tp:,.2f}" if isinstance(tp, (int, float)) else f": {tp}"))
+        table.add_row("TP", f": {tp} (Dynamic Trailing)" if tp in ('--', 0, 0.0, None) else (f": ${tp:,.2f}" if isinstance(tp, (int, float)) else f": {tp}"))
         
         pnl = self.position_data.get("unrealized_pnl", "--")
         if isinstance(pnl, (int, float)):
@@ -193,7 +198,7 @@ class Dashboard:
         margin_pnl_pct = self.position_data.get('margin_pnl_pct', '--')
         if isinstance(margin_pnl_pct, (int, float)):
             pct_color = "green" if margin_pnl_pct >= 0 else "red"
-            table.add_row("Margin P&L %", Text(f": {margin_pnl_pct:.2f}%", style=pct_color))
+            table.add_row("Margin P&L %", Text(f": {margin_pnl_pct:+.2f}%", style=pct_color))
         else:
             table.add_row("Margin P&L %", f": {margin_pnl_pct}")
 
@@ -224,6 +229,7 @@ class Dashboard:
             table.add_row("Health", Text(f": {health}", style=h_color))
         
         return Panel(table, title="POSITION", border_style="magenta")
+
 
     def _build_signal_panel(self) -> Panel:
         table = Table.grid(padding=(0, 1))
@@ -310,10 +316,27 @@ class Dashboard:
             Layout(name="row2", ratio=1)
         )
         
-        layout["row1"].split_row(
-            Layout(name="account", ratio=1),
-            Layout(name="position", ratio=1)
+        has_active_pos = bool(
+            self.position_data
+            and self.position_data.get('symbol')
+            and self.position_data.get('symbol') != '--'
         )
+
+        if has_active_pos:
+            layout["row1"].split_row(
+                Layout(name="account", ratio=1),
+                Layout(name="position", ratio=1),
+                Layout(name="market_watch", ratio=1),
+            )
+            layout["position"].update(self._build_position_panel())
+        else:
+            layout["row1"].split_row(
+                Layout(name="account", ratio=1),
+                Layout(name="market_watch", ratio=2),
+            )
+
+        layout["account"].update(self._build_account_panel())
+        layout["market_watch"].update(self._build_market_watch_panel())
         
         layout["row2"].split_row(
             Layout(name="signal", ratio=1),
@@ -326,14 +349,12 @@ class Dashboard:
         header_text = Text(f"[{self.mode}] TRADING BOT - DELTA INDIA  |  UTC: {now_utc}  |  STATUS: RUNNING (150x SCALP)", style=f"bold {mode_color}", justify="center")
         layout["header"].update(Panel(header_text))
         
-        layout["account"].update(self._build_account_panel())
-        layout["position"].update(self._build_position_panel())
-        
         layout["signal"].update(self._build_signal_panel())
         layout["risk"].update(self._build_risk_panel())
         layout["execution"].update(self._build_execution_panel())
         
         return layout
+
 
     async def run(self, update_callback: Callable[[], Awaitable[None]]) -> None:
         logger.info("Starting dashboard loop")

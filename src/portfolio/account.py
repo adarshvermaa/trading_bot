@@ -25,6 +25,11 @@ class Position:
     current_price: float = 0.0
     contract_value: float = 1.0
 
+CONTRACT_VALUES: Dict[str, float] = {
+    "BTCUSD": 0.001,
+    "ETHUSD": 0.01,
+}
+
 class AccountManager:
     def __init__(self, is_paper: bool = False, initial_paper_balance: float = 10000.0, paper_balance: Optional[float] = None):
         self.is_paper = is_paper
@@ -35,8 +40,18 @@ class AccountManager:
         self.reserve: float = (self.equity * 0.20) if is_paper else 0.0
         self.daily_pnl: float = 0.0
         self.daily_start_equity: float = self.equity
+        self.contract_values: Dict[str, float] = dict(CONTRACT_VALUES)
         
         self.positions: Dict[str, Position] = {}
+
+    def get_contract_value(self, symbol: str) -> float:
+        if symbol in self.contract_values:
+            return self.contract_values[symbol]
+        if "BTC" in symbol:
+            return 0.001
+        if "ETH" in symbol:
+            return 0.01
+        return 1.0
         
     def update_from_exchange(self, balances: Dict[str, Any], exchange_positions: List[Dict[str, Any]]):
         if self.is_paper:
@@ -48,35 +63,55 @@ class AccountManager:
         self.used_margin = float(balances.get('position_margin', balances.get('used_margin', balances.get('margin', self.used_margin))))
         self.reserve = self.equity * 0.20
         
-        # Update positions
-        self.positions.clear()
+        # Update positions while preserving contract_value, leverage, SL, and TP
+        new_positions = {}
         for p in exchange_positions:
             symbol = p.get('product_symbol') or p.get('symbol')
             size_raw = float(p.get('size', 0.0))
             if symbol and abs(size_raw) > 0:
-                self.positions[symbol] = Position(
+                cv = self.get_contract_value(symbol)
+                entry_p = float(p.get('entry_price', 0.0))
+                size_abs = abs(int(size_raw))
+                notional = size_abs * cv * entry_p
+                
+                existing = self.positions.get(symbol)
+                lev = existing.leverage if (existing and existing.leverage > 1) else int(float(p.get('leverage', 150) or 150))
+                sl_val = existing.sl if (existing and existing.sl > 0) else float(p.get('sl', 0.0))
+                tp_val = existing.tp if (existing and existing.tp > 0) else float(p.get('tp', 0.0))
+                entry_t = existing.entry_time if existing else float(p.get('entry_time', time.time()))
+                margin_val = float(p.get('margin', p.get('position_margin', 0.0)))
+                if margin_val <= 0 and lev > 0:
+                    margin_val = notional / lev
+                
+                new_positions[symbol] = Position(
                     symbol=symbol,
                     side='LONG' if size_raw > 0 else 'SHORT',
-                    entry_price=float(p.get('entry_price', 0.0)),
-                    entry_time=float(p.get('entry_time', time.time())),
-                    size=abs(int(size_raw)),
-                    leverage=int(float(p.get('leverage', 1))),
-                    margin=float(p.get('margin', p.get('position_margin', 0.0))),
-                    notional=float(p.get('notional', 0.0)),
-                    sl=float(p.get('sl', 0.0)),
-                    tp=float(p.get('tp', 0.0)),
-                    unrealized_pnl=float(p.get('unrealized_pnl', 0.0))
+                    entry_price=entry_p,
+                    entry_time=entry_t,
+                    size=size_abs,
+                    leverage=lev,
+                    margin=margin_val,
+                    notional=notional,
+                    sl=sl_val,
+                    tp=tp_val,
+                    unrealized_pnl=float(p.get('unrealized_pnl', 0.0)) if ('unrealized_pnl' in p and p['unrealized_pnl'] is not None) else (existing.unrealized_pnl if existing else 0.0),
+                    current_price=existing.current_price if existing else entry_p,
+                    contract_value=cv,
                 )
 
-    def update_unrealized_pnl(self, symbol: str, current_price: float, contract_value: float = 1.0):
+        self.positions = new_positions
+
+
+    def update_unrealized_pnl(self, symbol: str, current_price: float, contract_value: Optional[float] = None):
         if symbol in self.positions:
             pos = self.positions[symbol]
             pos.current_price = current_price
-            pos.contract_value = contract_value
+            cv = contract_value if (contract_value is not None and contract_value != 1.0) else (pos.contract_value or self.get_contract_value(symbol))
+            pos.contract_value = cv
             if pos.side == 'LONG':
-                pnl = (current_price - pos.entry_price) * pos.size * contract_value
+                pnl = (current_price - pos.entry_price) * pos.size * cv
             else:
-                pnl = (pos.entry_price - current_price) * pos.size * contract_value
+                pnl = (pos.entry_price - current_price) * pos.size * cv
             pos.unrealized_pnl = pnl
 
     def update_current_price(self, symbol: str, current_price: float):
@@ -84,10 +119,12 @@ class AccountManager:
         if symbol in self.positions:
             pos = self.positions[symbol]
             pos.current_price = current_price
+            cv = pos.contract_value or self.get_contract_value(symbol)
+            pos.contract_value = cv
             if pos.side == 'LONG':
-                pos.unrealized_pnl = (current_price - pos.entry_price) * pos.size * pos.contract_value
+                pos.unrealized_pnl = (current_price - pos.entry_price) * pos.size * cv
             else:
-                pos.unrealized_pnl = (pos.entry_price - current_price) * pos.size * pos.contract_value
+                pos.unrealized_pnl = (pos.entry_price - current_price) * pos.size * cv
 
     def update_paper_position(
         self,
@@ -109,6 +146,7 @@ class AccountManager:
             self.available_margin = max(0.0, self.equity - self.used_margin)
             return
 
+        cv = self.get_contract_value(symbol)
         self.positions[symbol] = Position(
             symbol=symbol,
             side=side,
@@ -122,18 +160,19 @@ class AccountManager:
             tp=tp,
             unrealized_pnl=0.0,
             current_price=price,
-            contract_value=notional / (size * price) if (size > 0 and price > 0) else 1.0,
+            contract_value=cv,
         )
         self.used_margin = sum(p.margin for p in self.positions.values())
         self.available_margin = max(0.0, self.equity - self.used_margin)
 
-    def close_paper_position(self, symbol: str, close_price: float, contract_value: float = 1.0) -> float:
+    def close_paper_position(self, symbol: str, close_price: float, contract_value: Optional[float] = None) -> float:
         if symbol in self.positions:
             pos = self.positions.pop(symbol)
+            cv = contract_value if (contract_value is not None and contract_value != 1.0) else (pos.contract_value or self.get_contract_value(symbol))
             if pos.side == 'LONG':
-                pnl = (close_price - pos.entry_price) * pos.size * contract_value
+                pnl = (close_price - pos.entry_price) * pos.size * cv
             else:
-                pnl = (pos.entry_price - close_price) * pos.size * contract_value
+                pnl = (pos.entry_price - close_price) * pos.size * cv
             self.equity += pnl
             self.daily_pnl += pnl
             self.used_margin = sum(p.margin for p in self.positions.values())

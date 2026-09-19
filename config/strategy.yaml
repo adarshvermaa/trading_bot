@@ -2,9 +2,7 @@ assets:
   universe:
     - BTCUSD
     - ETHUSD
-  binance_symbol_map:
-    BTCUSD: btcusdt
-    ETHUSD: ethusdt
+
 
 timeframes:
   - "15m"
@@ -42,3 +40,10 @@ scanner:
     regime: 0.20
     indicators: 0.25
     ml_confidence: 0.20
+
+execution:
+  order_type: "market"              # "market" for instant fills or "limit" for maker orders
+  unfilled_timeout_seconds: 10      # Auto-cancel unfilled orders after 10 seconds
+  use_orderbook_pricing: true       # When limit is used, cross spread at Best Ask (Buy) / Best Bid (Sell)
+  max_slippage_bps: 15.0            # Max allowable spread/slippage before aborting
+

@@ -104,11 +104,10 @@ async def test_btc_eth_asset_ranking():
     bot = ScalpingBot(config=load_config(), mode="paper")
     
     # Pre-seed candles for both BTCUSD and ETHUSD
+    from src.data.delta_ws import Candle
     for sym in ["BTCUSD", "ETHUSD"]:
-        bin_sym = bot.config.strategy.assets.binance_symbol_map[sym]
         for tf in ["1m", "5m", "15m"]:
             for i in range(60):
-                from src.data.binance_ws import Candle
                 c = Candle(
                     open_time=1000 + i*60,
                     open=100.0 + i,
@@ -119,7 +118,7 @@ async def test_btc_eth_asset_ranking():
                     close_time=1000 + (i+1)*60,
                     is_closed=True
                 )
-                bot.binance_ws.candle_store.add_candle(bin_sym, tf, c)
+                bot.delta_ws.candle_store.add_candle(sym, tf, c)
                 
     best = await bot._scan_assets()
     assert len(bot._asset_rankings) == 2

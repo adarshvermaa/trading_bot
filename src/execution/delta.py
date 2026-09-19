@@ -26,6 +26,7 @@ class PaperPosition:
     bracket_sl: float = 0.0
     bracket_tp: float = 0.0
     side: str = "buy"
+    contract_value: float = 1.0
 
 @dataclass
 class PaperAccount:
@@ -58,6 +59,46 @@ class RateLimiter:
         self.budget -= weight
 
 
+DELTA_DEFAULT_PRODUCTS: Dict[str, Dict[str, Any]] = {
+    "BTCUSD": {
+        "id": 27,
+        "symbol": "BTCUSD",
+        "contract_type": "perpetual_futures",
+        "contract_value": 0.001,
+        "tick_size": 0.5,
+        "initial_margin": 0.5,
+        "default_leverage": 200.0,
+        "max_leverage": 200.0,
+        "taker_commission_rate": 0.0005,
+        "maker_commission_rate": 0.0002,
+        "state": "live",
+        "trading_status": "operational",
+    },
+    "ETHUSD": {
+        "id": 3136,
+        "symbol": "ETHUSD",
+        "contract_type": "perpetual_futures",
+        "contract_value": 0.01,
+        "tick_size": 0.05,
+        "initial_margin": 0.5,
+        "default_leverage": 200.0,
+        "max_leverage": 200.0,
+        "taker_commission_rate": 0.0005,
+        "maker_commission_rate": 0.0002,
+        "state": "live",
+        "trading_status": "operational",
+    },
+}
+
+def normalize_delta_symbol(symbol: str) -> str:
+    """Normalize asset or symbol string into Delta's official perpetual symbol (BTCUSD or ETHUSD)."""
+    s = (symbol or "").upper().strip()
+    if s in ("BTC", "BTCUSD", "BTCUSDT"):
+        return "BTCUSD"
+    if s in ("ETH", "ETHUSD", "ETHUSDT"):
+        return "ETHUSD"
+    return s
+
 class DeltaExchangeClient:
     def __init__(
         self,
@@ -84,6 +125,7 @@ class DeltaExchangeClient:
         
         self.rate_limiter = RateLimiter()
         self.products_cache: Dict[str, Dict[str, Any]] = {}
+        self.products_by_id_cache: Dict[int, Dict[str, Any]] = {}
         self._latest_prices: Dict[str, float] = {}
         self._latest_mark_prices: Dict[str, float] = {}
         
@@ -118,15 +160,17 @@ class DeltaExchangeClient:
             
         body_str = json.dumps(body) if body else ""
         
-        signature = self._generate_signature(method, timestamp, path, query_string, body_str)
-        
         headers = {
-            "api-key": self.api_key,
-            "signature": signature,
-            "timestamp": timestamp,
-            "User-Agent": "python-scalping-bot",
-            "Content-Type": "application/json"
+            "User-Agent": "rest-client",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
         }
+        # Only attach signing headers if API credentials are present
+        if self.api_key and self.api_secret:
+            signature = self._generate_signature(method, timestamp, path, query_string, body_str)
+            headers["api-key"] = self.api_key
+            headers["signature"] = signature
+            headers["timestamp"] = timestamp
         
         url = self.base_url + path + query_string
         
@@ -143,6 +187,22 @@ class DeltaExchangeClient:
                 
         return await make_request()
 
+    async def fetch_target_products(self, symbols: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
+        """Fetch and cache official Delta product specifications for BTC and ETH only."""
+        target_symbols = symbols if symbols is not None else ["BTCUSD", "ETHUSD"]
+        fetched = {}
+        for sym in target_symbols:
+            norm_sym = normalize_delta_symbol(sym)
+            try:
+                prod = await self.get_product(norm_sym)
+                fetched[norm_sym] = prod
+            except Exception as e:
+                logger.debug(f"Could not fetch product {norm_sym} from Delta REST: {e}")
+                if norm_sym in DELTA_DEFAULT_PRODUCTS:
+                    fetched[norm_sym] = DELTA_DEFAULT_PRODUCTS[norm_sym]
+                    self.products_cache[norm_sym] = DELTA_DEFAULT_PRODUCTS[norm_sym]
+        return fetched
+
     async def get_products(self, contract_types: str = "perpetual_futures,futures") -> List[Dict[str, Any]]:
         """Fetch products from Delta Exchange filtered strictly to futures contracts."""
         params = {"contract_types": contract_types, "states": "live"}
@@ -152,22 +212,39 @@ class DeltaExchangeClient:
             for product in result:
                 if product.get("contract_type") in ("perpetual_futures", "futures"):
                     self.products_cache[product["symbol"]] = product
+                    if "id" in product:
+                        self.products_by_id_cache[int(product["id"])] = product
                     futures_products.append(product)
         return futures_products
 
     async def get_product(self, symbol: str) -> Dict[str, Any]:
         """Fetch and validate a single product, ensuring it is a futures contract."""
-        if symbol not in self.products_cache:
-            await self.get_products()
+        norm_sym = normalize_delta_symbol(symbol)
+        if norm_sym not in self.products_cache:
+            try:
+                await self.get_products()
+            except Exception:
+                pass
             
-        if symbol in self.products_cache:
-            product = self.products_cache[symbol]
+        if norm_sym in self.products_cache:
+            product = self.products_cache[norm_sym]
         else:
-            product = await self._request("GET", f"/v2/products/{symbol}", weight=3)
-            if product.get("contract_type") not in ("perpetual_futures", "futures"):
-                logger.error(f"Product {symbol} rejected: type is {product.get('contract_type')} (futures only supported)")
-                raise DeltaAPIError(f"Product {symbol} is {product.get('contract_type')}. Only futures products are supported.")
-            self.products_cache[symbol] = product
+            try:
+                product = await self._request("GET", f"/v2/products/{norm_sym}", weight=3)
+                self.products_cache[norm_sym] = product
+            except Exception as e:
+                if norm_sym in DELTA_DEFAULT_PRODUCTS:
+                    product = DELTA_DEFAULT_PRODUCTS[norm_sym]
+                    self.products_cache[norm_sym] = product
+                else:
+                    raise DeltaAPIError(f"Product {symbol} fetch failed: {e}")
+
+        if product.get("contract_type") not in ("perpetual_futures", "futures"):
+            logger.error(f"Product {symbol} rejected: type is {product.get('contract_type')} (futures only supported)")
+            raise DeltaAPIError(f"Product {symbol} is {product.get('contract_type')}. Only futures products are supported.")
+            
+        if "id" in product:
+            self.products_by_id_cache[int(product["id"])] = product
             
         initial_margin = float(product.get("initial_margin", "0.01"))
         def_lev = float(product.get("default_leverage", 0.0))
@@ -179,19 +256,23 @@ class DeltaExchangeClient:
         elif initial_margin > 0:
             max_leverage = (100.0 / initial_margin) if initial_margin > 0.05 else (1.0 / initial_margin)
         else:
-            max_leverage = 100.0
+            max_leverage = 200.0
+
+        contract_val = float(product.get("contract_value", 0.001 if "BTC" in norm_sym else 0.01))
+        tick_sz = float(product.get("tick_size", 0.5 if "BTC" in norm_sym else 0.05))
+
         return {
-            "id": product["id"],
-            "symbol": product.get("symbol", symbol),
+            "id": int(product["id"]),
+            "symbol": product.get("symbol", norm_sym),
             "contract_type": product.get("contract_type", "perpetual_futures"),
-            "contract_value": float(product.get("contract_value", 1)),
-            "tick_size": float(product.get("tick_size", 0.1)),
+            "contract_value": contract_val,
+            "tick_size": tick_sz,
             "initial_margin": initial_margin,
             "max_leverage": max_leverage,
-            "taker_commission_rate": float(product.get("taker_commission_rate", 0)),
-            "maker_commission_rate": float(product.get("maker_commission_rate", 0)),
-            "state": product.get("state"),
-            "trading_status": product.get("trading_status")
+            "taker_commission_rate": float(product.get("taker_commission_rate", 0.0005)),
+            "maker_commission_rate": float(product.get("maker_commission_rate", 0.0002)),
+            "state": product.get("state", "live"),
+            "trading_status": product.get("trading_status", "operational")
         }
 
     async def get_wallet_balances(self) -> Dict[str, Any]:
@@ -278,23 +359,97 @@ class DeltaExchangeClient:
         bracket_take_profit_price: Optional[float] = None, 
         client_order_id: Optional[str] = None, 
         reduce_only: bool = False,
-        tick_size: Optional[float] = None
+        tick_size: Optional[float] = None,
+        symbol: Optional[str] = None,
+        market_price: Optional[float] = None,
     ) -> Dict[str, Any]:
-        normalized_order_type = "limit_order" if order_type.lower() in ("limit", "limit_order") else "market_order"
+        # Force market order only on Delta Exchange - limit orders are removed
+        normalized_order_type = "market_order"
         normalized_side = "buy" if side.lower() in ("buy", "long") else "sell"
-        
+        passed_price = market_price if (market_price is not None and market_price > 0) else limit_price
+        limit_price = None  # Market orders strictly do not use limit price
+
         # Format prices to tick_size if available
         if tick_size and tick_size > 0:
-            if limit_price is not None:
-                limit_price = round_to_tick(limit_price, tick_size)
             if bracket_stop_loss_price is not None:
                 bracket_stop_loss_price = round_to_tick(bracket_stop_loss_price, tick_size)
             if bracket_take_profit_price is not None:
                 bracket_take_profit_price = round_to_tick(bracket_take_profit_price, tick_size)
 
+        # Resolve symbol if not provided
+        resolved_symbol = symbol
+        if not resolved_symbol:
+            prod_info = self.products_by_id_cache.get(int(product_id))
+            if prod_info:
+                resolved_symbol = prod_info.get("symbol")
+            else:
+                for s, p in self.products_cache.items():
+                    if p.get("id") == product_id or str(p.get("id")) == str(product_id):
+                        resolved_symbol = s
+                        break
+
+        # Resolve contract value (0.001 for BTCUSD, 0.01 for ETHUSD)
+        cv = 1.0
+        if resolved_symbol:
+            if "BTC" in resolved_symbol.upper():
+                cv = 0.001
+            elif "ETH" in resolved_symbol.upper():
+                cv = 0.01
+            elif resolved_symbol in self.products_cache:
+                cv = float(self.products_cache[resolved_symbol].get("contract_value", 1.0))
+        elif int(product_id) in self.products_by_id_cache:
+            cv = float(self.products_by_id_cache[int(product_id)].get("contract_value", 1.0))
+
         if not self.live_trading:
-            fill_price = limit_price if limit_price else 1000.0
-            pos = self.paper_account.positions.get(product_id, PaperPosition(product_id=product_id, symbol=str(product_id)))
+            fill_price: Optional[float] = None
+
+            # 1) Try Delta L2 Orderbook for true market execution (Best Ask for Buy, Best Bid for Sell)
+            if resolved_symbol:
+                try:
+                    best_bid, best_ask = await self.get_best_bid_ask(resolved_symbol)
+                    if normalized_side == "buy" and best_ask and best_ask > 0:
+                        fill_price = best_ask
+                    elif normalized_side == "sell" and best_bid and best_bid > 0:
+                        fill_price = best_bid
+                except Exception as e:
+                    logger.debug(f"Could not fetch orderbook for {resolved_symbol}: {e}")
+
+            # 2) If orderbook gave no price, try Delta's latest price cache
+            if fill_price is None and resolved_symbol:
+                fill_price = self.get_latest_price(resolved_symbol) or self.get_latest_mark_price(resolved_symbol)
+
+            # 3) If not in cache, fetch ticker from Delta REST
+            if fill_price is None and resolved_symbol:
+                try:
+                    fill_price = await self.fetch_ticker_price(resolved_symbol)
+                except Exception as e:
+                    logger.debug(f"Could not fetch ticker for {resolved_symbol}: {e}")
+
+            # 4) If still None, use caller's live market_price or passed price
+            if fill_price is None and passed_price is not None and passed_price > 0:
+                fill_price = passed_price
+
+            # 5) If still None, check numeric string in _latest_prices
+            if fill_price is None and str(product_id) in self._latest_prices:
+                fill_price = self._latest_prices[str(product_id)]
+
+            if fill_price is None or fill_price <= 0:
+                logger.error(f"Cannot execute market order: No live market price available for {resolved_symbol or product_id}")
+                raise DeltaAPIError(f"No market price available from Delta Exchange for {resolved_symbol or product_id}")
+
+            if tick_size and tick_size > 0:
+                fill_price = round_to_tick(fill_price, tick_size)
+
+            pos = self.paper_account.positions.get(
+                product_id, 
+                PaperPosition(
+                    product_id=product_id, 
+                    symbol=resolved_symbol or str(product_id),
+                    contract_value=cv,
+                )
+            )
+            pos.symbol = resolved_symbol or pos.symbol
+            pos.contract_value = cv
             size_change = size if normalized_side == "buy" else -size
             new_size = pos.size + size_change
             if new_size != 0:
@@ -314,28 +469,55 @@ class DeltaExchangeClient:
                 "product_id": product_id, 
                 "size": size, 
                 "side": normalized_side,
-                "limit_price": limit_price,
+                "order_type": "market_order",
+                "limit_price": None,
+                "fill_price": fill_price,
+                "average_fill_price": fill_price,
                 "bracket_stop_loss_price": bracket_stop_loss_price,
                 "bracket_take_profit_price": bracket_take_profit_price
             }
             
+        prod_sym = resolved_symbol
+        if not prod_sym:
+            prod_sym = "BTCUSD" if int(product_id) == 27 else "ETHUSD"
+
         body: Dict[str, Any] = {
             "product_id": int(product_id),
+            "product_symbol": prod_sym,
             "side": normalized_side,
-            "size": int(size) if size >= 1 else size,
-            "order_type": normalized_order_type,
+            "size": max(1, int(round(size))),
+            "order_type": "market_order",
+            "time_in_force": "gtc",
             "reduce_only": reduce_only
         }
-        if limit_price is not None:
-            body["limit_price"] = format_price(limit_price, tick_size) if (tick_size and tick_size > 0) else str(limit_price)
         if bracket_stop_loss_price is not None:
             body["bracket_stop_loss_price"] = format_price(bracket_stop_loss_price, tick_size) if (tick_size and tick_size > 0) else str(bracket_stop_loss_price)
+            body["stop_trigger_method"] = "last_traded_price"
+            body["bracket_stop_trigger_method"] = "last_traded_price"
         if bracket_take_profit_price is not None:
             body["bracket_take_profit_price"] = format_price(bracket_take_profit_price, tick_size) if (tick_size and tick_size > 0) else str(bracket_take_profit_price)
+            body["stop_trigger_method"] = "last_traded_price"
+            body["bracket_stop_trigger_method"] = "last_traded_price"
         if client_order_id is not None:
             body["client_order_id"] = client_order_id
             
         return await self._request("POST", "/v2/orders", body=body, weight=5)
+
+    async def get_best_bid_ask(self, symbol: str) -> tuple[Optional[float], Optional[float]]:
+        """Return (best_bid, best_ask) from Delta's live L2 orderbook."""
+        try:
+            ob = await self.get_orderbook(symbol, depth=5)
+            if not ob:
+                return None, None
+            bids = ob.get("buy", [])
+            asks = ob.get("sell", [])
+            best_bid = float(bids[0]["price"]) if bids and "price" in bids[0] else None
+            best_ask = float(asks[0]["price"]) if asks and "price" in asks[0] else None
+            return best_bid, best_ask
+        except Exception as e:
+            logger.debug(f"Failed to fetch best bid/ask for {symbol}: {e}")
+            return None, None
+
 
     async def cancel_order(self, order_id: str, product_id: int) -> Dict[str, Any]:
         if not self.live_trading:
@@ -417,11 +599,18 @@ class DeltaExchangeClient:
         if not pos or pos.size == 0:
             return 0.0
         
+        cv = getattr(pos, "contract_value", 1.0)
+        if cv == 1.0:
+            if "BTC" in pos.symbol.upper():
+                cv = 0.001
+            elif "ETH" in pos.symbol.upper():
+                cv = 0.01
+
         is_long = pos.side == "buy"
         if is_long:
-            pnl = (close_price - pos.entry_price) * abs(pos.size)
+            pnl = (close_price - pos.entry_price) * abs(pos.size) * cv
         else:
-            pnl = (pos.entry_price - close_price) * abs(pos.size)
+            pnl = (pos.entry_price - close_price) * abs(pos.size) * cv
         
         # Update paper account
         self.paper_account.equity += pnl
@@ -442,7 +631,7 @@ class DeltaExchangeClient:
             self.paper_account.positions[product_id].bracket_sl = new_sl
 
     async def update_bracket_stop_loss(
-        self, product_id: int, new_sl: float, tick_size: Optional[float] = None
+        self, product_id: int, new_sl: float, tick_size: Optional[float] = None, order_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Update the bracket stop loss price on Delta Exchange (or paper position)."""
         if tick_size and tick_size > 0:
@@ -452,10 +641,22 @@ class DeltaExchangeClient:
             self.update_paper_sl(product_id, new_sl)
             return {"success": True, "bracket_stop_loss_price": new_sl}
 
+        prod_symbol = "BTCUSD" if int(product_id) == 27 else "ETHUSD"
+        if int(product_id) in self.products_by_id_cache:
+            prod_symbol = self.products_by_id_cache[int(product_id)].get("symbol", prod_symbol)
+
         body: Dict[str, Any] = {
             "product_id": int(product_id),
-            "bracket_stop_loss_price": format_price(new_sl, tick_size) if (tick_size and tick_size > 0) else str(new_sl)
+            "product_symbol": prod_symbol,
+            "bracket_stop_loss_price": format_price(new_sl, tick_size) if (tick_size and tick_size > 0) else str(new_sl),
+            "bracket_stop_trigger_method": "last_traded_price",
         }
+        if order_id:
+            try:
+                body["id"] = int(order_id)
+            except ValueError:
+                pass
+
         try:
             return await self._request("PUT", "/v2/orders/bracket", body=body, weight=5)
         except Exception as e:
@@ -509,10 +710,22 @@ class DeltaExchangeClient:
 
     def get_latest_price(self, symbol: str) -> Optional[float]:
         """Return the freshest LTP for a symbol from Delta Exchange."""
+        if not symbol:
+            return None
+        if symbol.isdigit() and int(symbol) in self.products_by_id_cache:
+            real_sym = self.products_by_id_cache[int(symbol)].get("symbol", "")
+            if real_sym and real_sym.upper() in self._latest_prices:
+                return self._latest_prices[real_sym.upper()]
         return self._latest_prices.get(symbol.upper())
 
     def get_latest_mark_price(self, symbol: str) -> Optional[float]:
         """Return the freshest mark price for a symbol from Delta Exchange."""
+        if not symbol:
+            return None
+        if symbol.isdigit() and int(symbol) in self.products_by_id_cache:
+            real_sym = self.products_by_id_cache[int(symbol)].get("symbol", "")
+            if real_sym and real_sym.upper() in self._latest_mark_prices:
+                return self._latest_mark_prices[real_sym.upper()]
         return self._latest_mark_prices.get(symbol.upper())
 
     async def fetch_ticker_price(self, symbol: str) -> Optional[float]:

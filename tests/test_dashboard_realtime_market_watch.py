@@ -3,19 +3,16 @@ import json
 import pytest
 from rich.panel import Panel
 
-from src.data.binance_ws import BinanceWSClient, Candle
+from src.data.delta_ws import DeltaWSClient, Candle
 from src.ui.dashboard import Dashboard
 from src.portfolio.account import AccountManager
 from src.risk.risk_manager import RiskManager
 from src.config import RiskConfig
 
 
-def test_binance_ws_get_latest_price_tick_and_fallback():
-    """Verify BinanceWSClient stores and returns latest prices on ticks and falls back to candles."""
-    client = BinanceWSClient(
-        symbols=["btcusdt", "ethusdt"],
-        binance_to_internal_symbol_map={"BTCUSDT": "BTCUSD", "ETHUSDT": "ETHUSD"},
-    )
+def test_delta_ws_get_latest_price_tick_and_fallback():
+    """Verify DeltaWSClient stores and returns latest prices on ticks and falls back to candles."""
+    client = DeltaWSClient(symbols=["BTCUSD", "ETHUSD"])
 
     # Initial state: None
     assert client.get_latest_price("BTCUSD") is None
@@ -41,44 +38,32 @@ def test_binance_ws_get_latest_price_tick_and_fallback():
     # Simulate live incoming tick price
     client._latest_prices["BTCUSD"] = 81250.0
     assert client.get_latest_price("BTCUSD") == 81250.0
-    # Case insensitivity & symbol aliases
+    # Case insensitivity
     assert client.get_latest_price("btcusd") == 81250.0
 
 
 @pytest.mark.asyncio
-async def test_binance_ws_handle_message_records_unclosed_tick_price():
-    """Verify incoming kline messages update _latest_prices even when is_closed (x) is False."""
-    client = BinanceWSClient(
-        symbols=["btcusdt"],
-        binance_to_internal_symbol_map={"BTCUSDT": "BTCUSD"},
-    )
+async def test_delta_ws_handle_message_records_unclosed_tick_price():
+    """Verify incoming candlestick and ticker messages update _latest_prices."""
+    client = DeltaWSClient(symbols=["BTCUSD"])
 
     msg = json.dumps({
-        "stream": "btcusdt@kline_1m",
-        "data": {
-            "e": "kline",
-            "s": "BTCUSDT",
-            "k": {
-                "t": 1000,
-                "T": 1060,
-                "s": "BTCUSDT",
-                "i": "1m",
-                "o": "81000.0",
-                "c": "81345.50",
-                "h": "81400.0",
-                "l": "80950.0",
-                "v": "15.5",
-                "x": False,  # unclosed live tick
-            }
-        }
+        "type": "candlestick_1m",
+        "symbol": "BTCUSD",
+        "resolution": "1m",
+        "candle_start_time": 1000 * 1_000_000,
+        "open": 81000.0,
+        "high": 81400.0,
+        "low": 80950.0,
+        "close": 81345.50,
+        "volume": 15.5,
     })
 
     await client._handle_message(msg)
 
     # Price should be immediately captured
     assert client.get_latest_price("BTCUSD") == 81345.50
-    assert client.get_latest_price("BTCUSDT") == 81345.50
-    assert client.get_latest_price("btcusdt") == 81345.50
+    assert client.get_latest_price("btcusd") == 81345.50
 
 
 def test_dashboard_market_watch_rendered_when_no_active_position():
@@ -218,3 +203,41 @@ def test_signal_panel_includes_live_feeds_and_next_trigger():
     sig_panel = dashboard._build_signal_panel()
     assert isinstance(sig_panel, Panel)
     assert sig_panel.title == "SIGNAL"
+
+
+def test_market_watch_and_position_both_rendered_in_layout_when_position_active():
+    """Verify that when a position is active, the layout contains BOTH POSITION and MARKET WATCH."""
+    dashboard = Dashboard(mode="live")
+    account = AccountManager(is_paper=False)
+    rm = RiskManager(RiskConfig())
+
+    active_pos_data = {
+        "symbol": "BTCUSD",
+        "side": "BUY",
+        "entry": 81000.0,
+        "current_price": 81250.0,
+        "leverage": 150,
+        "margin": 2.0,
+        "notional": 300.0,
+        "sl": 80730.0,
+        "tp": 81540.0,
+        "unrealized_pnl": 0.25,
+        "margin_pnl_pct": 12.5,
+        "holding_time": "15s",
+    }
+
+    dashboard.update(
+        account_data=account.to_dashboard_dict(),
+        position_data=active_pos_data,
+        signal_data={"btc_price": 81250.0, "eth_price": 2650.0},
+        risk_data=rm.get_risk_status(),
+        execution_data={"order_id": "delta_999", "order_status": "FILLED"},
+        market_watch_data={"assets": {}},
+    )
+
+    layout = dashboard.render()
+    assert layout.get("position") is not None
+    assert layout.get("market_watch") is not None
+    assert layout.get("account") is not None
+
+

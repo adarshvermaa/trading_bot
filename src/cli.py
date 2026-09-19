@@ -12,7 +12,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments for the scalping bot."""
     parser = argparse.ArgumentParser(
         prog="crypto-scalper",
-        description="Crypto scalping bot — Binance data + Delta Exchange execution",
+        description="Crypto scalping bot — Delta Exchange market data + execution",
     )
     parser.add_argument(
         "--mode",

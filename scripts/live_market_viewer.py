@@ -9,7 +9,7 @@ from rich.table import Table
 from rich.text import Text
 
 from src.config import load_config
-from src.data.binance_ws import BinanceWSClient, Candle
+from src.data.delta_ws import DeltaWSClient, Candle
 from src.strategy.structure import MarketStructure
 from src.strategy.signals import SignalGenerator, compute_atr, compute_vwap, compute_rsi, compute_adx
 from src.strategy.regime import RegimeFilter
@@ -26,10 +26,10 @@ def to_arr(candles):
         "volume": np.array([c.volume for c in candles], dtype=float),
     }
 
-async def analyze_asset(symbol, bin_sym, client, market_structure, signal_gen, regime_filter, onnx_model, weights):
-    c_15m = client.candle_store.get_candles(bin_sym, "15m")
-    c_5m = client.candle_store.get_candles(bin_sym, "5m")
-    c_1m = client.candle_store.get_candles(bin_sym, "1m")
+async def analyze_asset(symbol, client, market_structure, signal_gen, regime_filter, onnx_model, weights):
+    c_15m = client.candle_store.get_candles(symbol, "15m")
+    c_5m = client.candle_store.get_candles(symbol, "5m")
+    c_1m = client.candle_store.get_candles(symbol, "1m")
 
     if len(c_15m) < 20 or len(c_5m) < 20 or len(c_1m) < 20:
         return None
@@ -103,14 +103,14 @@ async def main():
     args = parser.parse_args()
 
     cfg = load_config()
-    client = BinanceWSClient(
-        symbols=list(cfg.strategy.assets.binance_symbol_map.values()),
-        binance_to_internal_symbol_map={v: k for k, v in cfg.strategy.assets.binance_symbol_map.items()},
+    client = DeltaWSClient(
+        symbols=list(cfg.strategy.assets.universe),
+        ws_url=cfg.env.delta_ws_url,
+        rest_url=cfg.env.delta_api_url,
         stale_data_seconds=cfg.risk.failsafe.stale_data_seconds,
-        ws_url=cfg.env.binance_ws_url,
     )
 
-    console.print("\n[bold cyan]⚡ Connecting to Binance Live Futures Stream (BTC & ETH)...[/bold cyan]\n")
+    console.print("\n[bold cyan]⚡ Connecting to Delta Exchange Live Stream (BTC & ETH)...[/bold cyan]\n")
     await client.bootstrap_historical_candles(limit=100)
 
     ms = MarketStructure(lookback=cfg.strategy.structure.min_swing_lookback)
@@ -126,8 +126,7 @@ async def main():
         while True:
             results = []
             for sym in cfg.strategy.assets.universe:
-                bin_sym = cfg.strategy.assets.binance_symbol_map[sym]
-                res = await analyze_asset(sym, bin_sym, client, ms, sg, rf, ml, weights)
+                res = await analyze_asset(sym, client, ms, sg, rf, ml, weights)
                 if res:
                     results.append(res)
 

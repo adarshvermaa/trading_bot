@@ -5,7 +5,7 @@ from src.execution.delta import DeltaExchangeClient
 from src.risk.risk_manager import RiskManager
 from src.config import load_config
 
-def test_delta_and_binance_sl_tp_ratios():
+def test_delta_sl_tp_ratios():
     """Verify that Stop Loss is -3.0% of margin and Trailing Stop is enabled up to +200% ceiling."""
     config = load_config()
     risk_manager = RiskManager(config.risk)
