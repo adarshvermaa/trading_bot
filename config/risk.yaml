@@ -17,8 +17,17 @@ stop_loss:
   min_stop_distance_atr: 0.1
 
 take_profit:
-  target_pct_of_margin: 0.06
-  target_pct_of_margin_max: 0.08
+  target_pct_of_margin: 2.00
+  target_pct_of_margin_max: 2.00
+
+trailing_stop:
+  enabled: true
+  activation_pct_of_margin: 0.02
+  buffer_pct_of_margin: 0.01
+  max_profit_cap_pct_of_margin: 2.00
+  scalper_offer_max_seconds_major: 1740  # 29 min (BTCUSD, ETHUSD) for Delta zero closing fee offer
+  scalper_offer_max_seconds_other: 840   # 14 min for other futures
+
 
 fees:
   taker_fee_pct: 0.0005

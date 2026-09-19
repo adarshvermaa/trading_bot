@@ -83,5 +83,5 @@ async def test_end_to_end_order_placement_margin_sl_tp():
 
     assert price_diff_sl > 0
     assert price_diff_tp > 0
-    # Target profit ratio to stop loss ratio is 2:1 (10% TP vs 5% SL)
-    assert pytest.approx(price_diff_tp / price_diff_sl, rel=0.1) == 2.0
+    expected_ratio = config.risk.take_profit.target_pct_of_margin / config.risk.stop_loss.max_loss_pct_of_margin
+    assert pytest.approx(price_diff_tp / price_diff_sl, rel=0.1) == expected_ratio

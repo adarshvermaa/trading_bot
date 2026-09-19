@@ -383,12 +383,10 @@ class SignalGenerator:
             elif not is_long and current_price > ema_50[-1]:
                 issues.append('Price above EMA50')
         
-        # 6. Time-based stall protection for ultra-fast scalping
-        if position_age_seconds > 300:  # > 5 minutes
-            pct_move = abs(current_price - entry_price) / entry_price if entry_price > 0 else 0.0
-            if pct_move < 0.0003:  # less than 0.03% move in 5 minutes
-                issues.append("Time-stop: Position stagnating > 5m without momentum")
-        elif position_age_seconds > 180:  # > 3 minutes
+        # 6. Delta Scalper Offer time-limit and stall monitor
+        if position_age_seconds >= 1680:  # >= 28 minutes (approaching 29m Delta Scalper Offer zero fee limit)
+            issues.append("Delta Scalper limit approaching (28m elapsed)")
+        elif position_age_seconds >= 180:  # >= 3 minutes
             pct_move = abs(current_price - entry_price) / entry_price if entry_price > 0 else 0.0
             if pct_move < 0.00015:  # flat position
                 issues.append("Stall warning: Trade flat after 3m")

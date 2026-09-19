@@ -129,7 +129,8 @@ class Dashboard:
 
         # Strategic status
         table.add_row("Target Lev", ": 150x Isolated")
-        table.add_row("Margin Target", ": -3.0% SL | +6.0% TP")
+        table.add_row("Margin Target", ": -3.0% SL | Trailing (+2%->+1% ... +200%)")
+        table.add_row("Delta Offer", ": 29m Limit (Zero Closing Fee)")
 
         trigger = self.market_watch_data.get("next_trigger") or self.signal_data.get("next_trigger", "Awaiting 5M BOS/CHoCH + ML >= 65%")
         trigger_col = "green" if "READY" in trigger.upper() else "yellow"
@@ -169,10 +170,18 @@ class Dashboard:
         table.add_row("Notional", f": ${notional:,.2f}" if isinstance(notional, (int, float)) else f": {notional}")
         
         sl = self.position_data.get('sl', '--')
-        table.add_row("SL", f": ${sl:,.2f}" if isinstance(sl, (int, float)) else f": {sl}")
+        sl_str = f"${sl:,.2f}" if isinstance(sl, (int, float)) else f"{sl}"
+        if isinstance(sl, (int, float)) and isinstance(entry, (int, float)) and entry > 0:
+            is_long = str(self.position_data.get('side', '')).upper() in ('BUY', 'LONG')
+            if (is_long and sl > entry) or (not is_long and sl < entry):
+                table.add_row("SL (Trailed)", Text(f": {sl_str} (Profit Locked)", style="bold green"))
+            else:
+                table.add_row("SL", f": {sl_str}")
+        else:
+            table.add_row("SL", f": {sl_str}")
         
         tp = self.position_data.get('tp', '--')
-        table.add_row("TP", f": ${tp:,.2f}" if isinstance(tp, (int, float)) else f": {tp}")
+        table.add_row("TP", f": {tp} (Dynamic Trailing)" if tp == '--' or tp == 0 else (f": ${tp:,.2f}" if isinstance(tp, (int, float)) else f": {tp}"))
         
         pnl = self.position_data.get("unrealized_pnl", "--")
         if isinstance(pnl, (int, float)):
@@ -188,7 +197,18 @@ class Dashboard:
         else:
             table.add_row("Margin P&L %", f": {margin_pnl_pct}")
 
-        table.add_row("Holding Time", f": {self.position_data.get('holding_time', '--')}")
+        ht_str = str(self.position_data.get('holding_time', '--'))
+        table.add_row("Holding Time", f": {ht_str}")
+
+        # Delta Scalper 29m timer
+        holding_sec = 0.0
+        if ht_str.endswith('s') and ht_str[:-1].isdigit():
+            holding_sec = float(ht_str[:-1])
+        remaining = max(0.0, 1740.0 - holding_sec)
+        rem_min = int(remaining // 60)
+        rem_sec = int(remaining % 60)
+        rem_col = "green" if remaining > 300 else ("yellow" if remaining > 60 else "bold red")
+        table.add_row("Delta Scalper", Text(f": {rem_min}m {rem_sec:02d}s left (Zero Fee)", style=rem_col))
 
         # Support/Resistance levels
         sup = self.position_data.get('nearest_support', 0)
@@ -256,6 +276,7 @@ class Dashboard:
         
         table.add_row("Max Loss", f": {self.risk_data.get('max_loss', '--')}")
         table.add_row("Target TP", f": {self.risk_data.get('target_profit', '--')}")
+        table.add_row("Time Limit", f": {self.risk_data.get('time_limit', '29m (Delta Scalper)')}")
         table.add_row("Spread", f": {self.risk_data.get('spread', '--')}")
         table.add_row("Slippage", f": {self.risk_data.get('slippage', '--')}")
         table.add_row("Liq Dist", f": {self.risk_data.get('liquidation_dist', '--')}")

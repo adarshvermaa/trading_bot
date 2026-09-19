@@ -60,6 +60,17 @@ class OrderManager:
                 return order
         return None
 
+    def update_active_sl(self, new_sl: float) -> bool:
+        """Update the stop loss price for the currently active order and portfolio position."""
+        ao = self.active_order
+        if not ao:
+            return False
+        ao.sl_price = new_sl
+        ao.last_event = "SL_TRAILED"
+        if self.account_manager and ao.symbol in self.account_manager.positions:
+            self.account_manager.positions[ao.symbol].sl = new_sl
+        return True
+
     async def has_active_position(self, product_id: Optional[int] = None) -> bool:
         try:
             if product_id is not None:

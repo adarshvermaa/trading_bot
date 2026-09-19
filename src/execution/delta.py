@@ -436,6 +436,32 @@ class DeltaExchangeClient:
         logger.info(f"Paper position closed: pnl={pnl:.2f}, new_equity={self.paper_account.equity:.2f}")
         return pnl
 
+    def update_paper_sl(self, product_id: int, new_sl: float) -> None:
+        """Update the stop loss price on an active paper position."""
+        if self.paper_account and product_id in self.paper_account.positions:
+            self.paper_account.positions[product_id].bracket_sl = new_sl
+
+    async def update_bracket_stop_loss(
+        self, product_id: int, new_sl: float, tick_size: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """Update the bracket stop loss price on Delta Exchange (or paper position)."""
+        if tick_size and tick_size > 0:
+            new_sl = round_to_tick(new_sl, tick_size)
+
+        if not self.live_trading:
+            self.update_paper_sl(product_id, new_sl)
+            return {"success": True, "bracket_stop_loss_price": new_sl}
+
+        body: Dict[str, Any] = {
+            "product_id": int(product_id),
+            "bracket_stop_loss_price": format_price(new_sl, tick_size) if (tick_size and tick_size > 0) else str(new_sl)
+        }
+        try:
+            return await self._request("PUT", "/v2/orders/bracket", body=body, weight=5)
+        except Exception as e:
+            logger.warning(f"Failed to update Delta bracket stop loss via PUT /v2/orders/bracket: {e}")
+            return {"success": False, "error": str(e)}
+
     async def ws_connect(self):
         if not self.live_trading or not self.api_key or not self.api_secret:
             logger.info("Delta private WS disabled (not in live mode or credentials missing).")

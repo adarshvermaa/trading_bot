@@ -169,18 +169,18 @@ def test_stall_protection_in_evaluate_position_health():
     assert health in ("WEAK", "STRONG")
     assert "Stall warning" in reason
 
-    # 2. Trade held for 350s (> 5 mins) with price flat
-    health_5m, reason_5m = sig_gen.evaluate_position_health(
+    # 2. Trade held for 1685s (> 28 mins), approaching Delta Scalper Offer zero fee limit
+    health_28m, reason_28m = sig_gen.evaluate_position_health(
         position_side="LONG",
         entry_price=130.0,
-        current_price=130.01, # flat move
+        current_price=130.01,
         candles_1m=candles_1m,
         candles_5m=candles_5m,
         nearest_support=115.0,
         nearest_resistance=150.0,
-        position_age_seconds=350.0,
+        position_age_seconds=1685.0,
     )
-    assert "Time-stop" in reason_5m
+    assert "Delta Scalper limit approaching" in reason_28m
 
 
 def test_margin_sl_tp_ratio_scalping_at_150x():

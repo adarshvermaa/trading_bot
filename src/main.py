@@ -213,6 +213,54 @@ class ScalpingBot:
                 if self.account_manager and symbol in self.account_manager.positions:
                     self.account_manager.update_current_price(symbol, live_price)
 
+                # --- 1a. Check Delta Scalper Offer time limit (29m for BTC/ETH, 14m for others) ---
+                trailing_cfg = getattr(self.config.risk, "trailing_stop", None)
+                max_holding_sec = getattr(trailing_cfg, "scalper_offer_max_seconds_major", 1740) if symbol in ("BTCUSD", "ETHUSD") else getattr(trailing_cfg, "scalper_offer_max_seconds_other", 840)
+                position_age = time.time() - getattr(active, "created_at", time.time())
+
+                if position_age >= max_holding_sec:
+                    logger.info(
+                        f"Delta Scalper Offer limit reached for {symbol} ({position_age:.0f}s >= {max_holding_sec}s). "
+                        f"Closing position at {live_price:.2f} to guarantee zero closing fee."
+                    )
+                    product = await self.delta_client.get_product(symbol)
+                    cv = float(product.get("contract_value", 1.0)) if product else 1.0
+
+                    pnl = await self.order_manager.close_and_record(
+                        reason="DELTA_SCALPER_OFFER_29M_LIMIT",
+                        close_price=live_price,
+                        contract_value=cv,
+                    )
+                    self.order_manager.clear_closed_orders()
+
+                    self._last_close_reason = "SCALPER_OFFER_29M"
+                    self._position_health = "--"
+                    self._re_entry_cooldown_until = time.time() + 5.0
+                    continue
+
+                # --- 1b. Dynamic Stepped Trailing Stop Loss on Margin P&L ---
+                if product_id:
+                    product = await self.delta_client.get_product(symbol)
+                    cv = float(product.get("contract_value", 1.0)) if product else 1.0
+                    tick_size = float(product.get("tick_size", 0.0)) if product else None
+                    pos_entry = self.account_manager.positions.get(symbol) if self.account_manager else None
+                    margin = pos_entry.margin if (pos_entry and pos_entry.margin > 0) else (active.entry_price * active.size * cv / max(1, self.config.risk.leverage.high_leverage_value))
+
+                    new_sl, updated, msg = self.risk_manager.calculate_trailing_stop_loss(
+                        entry_price=active.entry_price,
+                        side=active.side,
+                        margin=margin,
+                        current_price=live_price,
+                        contract_value=cv,
+                        size=int(active.size),
+                        current_sl=active.sl_price or 0.0,
+                        tick_size=tick_size,
+                    )
+                    if updated:
+                        self.order_manager.update_active_sl(new_sl)
+                        await self.delta_client.update_bracket_stop_loss(product_id, new_sl, tick_size)
+                        logger.info(f"[TRAILING SL] {symbol}: {msg}")
+
                 # --- 2. Check paper SL/TP triggers ---
                 if not self.delta_client.live_trading and product_id:
                     sl_tp_result = self.delta_client.check_paper_sl_tp(product_id, live_price)

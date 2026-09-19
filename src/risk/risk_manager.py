@@ -145,6 +145,78 @@ class RiskManager:
             
         return tp_price
 
+    def calculate_trailing_stop_loss(
+        self,
+        entry_price: float,
+        side: str,
+        margin: float,
+        current_price: float,
+        contract_value: float,
+        size: int,
+        current_sl: float,
+        tick_size: Optional[float] = None
+    ) -> Tuple[float, bool, str]:
+        """Calculate dynamic stepped trailing stop loss based on unrealized P&L on margin.
+        
+        Rules:
+        - When unrealized margin P&L < +2%: Keep initial SL (-3% margin).
+        - When unrealized margin P&L >= +2%:
+          SL is moved to +(int(floor(margin_pnl_pct)) - 1)% of margin.
+          E.g.:
+            +2% margin P&L -> SL = +1% of margin
+            +3% margin P&L -> SL = +2% of margin
+            +4% margin P&L -> SL = +3% of margin
+            ...
+            +10% margin P&L -> SL = +9% of margin
+            up to +200% margin P&L -> SL = +199% of margin
+        - Ratchet rule: SL price can only move in favor of the position (never backwards).
+        
+        Returns: (new_sl_price, updated, log_reason)
+        """
+        qty = (size * contract_value) if (size > 0 and contract_value > 0) else 0.0
+        if qty <= 0 or margin <= 0:
+            return current_sl, False, "Invalid qty or margin"
+
+        is_long = side.upper() in ('LONG', 'BUY')
+        if is_long:
+            unrealized_pnl = (current_price - entry_price) * qty
+        else:
+            unrealized_pnl = (entry_price - current_price) * qty
+
+        margin_pnl_pct = (unrealized_pnl / margin) * 100.0
+
+        trailing_cfg = getattr(self.config, "trailing_stop", None)
+        activation_pct = (getattr(trailing_cfg, "activation_pct_of_margin", 0.02) * 100.0) if trailing_cfg else 2.0
+        max_cap_pct = (getattr(trailing_cfg, "max_profit_cap_pct_of_margin", 2.00) * 100.0) if trailing_cfg else 200.0
+
+        if margin_pnl_pct < activation_pct:
+            return current_sl, False, f"Margin P&L {margin_pnl_pct:.2f}% below +{activation_pct:.0f}% trailing activation"
+
+        # Determine stepped integer target
+        step = int(math.floor(margin_pnl_pct))
+        step = min(step, int(max_cap_pct))
+        target_margin_pct = (step - 1) / 100.0  # e.g. step=2 -> +0.01 (+1% profit)
+
+        profit_at_sl = margin * target_margin_pct
+        price_diff = profit_at_sl / qty
+
+        if is_long:
+            candidate_sl = entry_price + price_diff
+            if tick_size and tick_size > 0:
+                candidate_sl = round_to_tick(candidate_sl, tick_size, direction='DOWN')
+            if candidate_sl > current_sl:
+                return candidate_sl, True, f"Trailing SL moved to +{step - 1}% margin profit at ${candidate_sl:,.2f}"
+            else:
+                return current_sl, False, f"Candidate SL ${candidate_sl:,.2f} <= current SL ${current_sl:,.2f}"
+        else:
+            candidate_sl = entry_price - price_diff
+            if tick_size and tick_size > 0:
+                candidate_sl = round_to_tick(candidate_sl, tick_size, direction='UP')
+            if candidate_sl < current_sl or current_sl <= 0:
+                return candidate_sl, True, f"Trailing SL moved to +{step - 1}% margin profit at ${candidate_sl:,.2f}"
+            else:
+                return current_sl, False, f"Candidate SL ${candidate_sl:,.2f} >= current SL ${current_sl:,.2f}"
+
     def calculate_position_size(self, equity: float, price: float, leverage: int, contract_value: float) -> Tuple[int, float, float]:
         allocatable = equity * self.config.capital.max_allocation_pct
         margin = allocatable
@@ -252,7 +324,8 @@ class RiskManager:
             "cooldown_active": (time.time() - self.last_loss_time) < self.config.daily_limits.cooldown_seconds,
             "risk_check": "PASS" if failsafe_ok else f"FAIL: {','.join(failsafe_reasons)}",
             "max_loss": f"{self.config.stop_loss.max_loss_pct_of_margin * 100:.1f}%",
-            "target_profit": f"{self.config.take_profit.target_pct_of_margin * 100:.1f}%",
+            "target_profit": "Trailing (+2%->+200%)",
+            "time_limit": "29m (Delta Scalper)",
             "spread": f"< {self.config.failsafe.max_spread_bps:.0f} bps",
             "slippage": f"{self.config.fees.estimated_slippage_pct * 100:.2f}%",
             "liquidation_dist": f"> {self.config.capital.reserve_pct * 100:.0f}%",

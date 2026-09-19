@@ -118,8 +118,17 @@ class StopLossConfig(BaseModel):
 
 
 class TakeProfitConfig(BaseModel):
-    target_pct_of_margin: float = 0.06
-    target_pct_of_margin_max: float = 0.08
+    target_pct_of_margin: float = 2.00
+    target_pct_of_margin_max: float = 2.00
+
+
+class TrailingStopConfig(BaseModel):
+    enabled: bool = True
+    activation_pct_of_margin: float = 0.02
+    buffer_pct_of_margin: float = 0.01
+    max_profit_cap_pct_of_margin: float = 2.00
+    scalper_offer_max_seconds_major: int = 1740  # 29 min (BTCUSD, ETHUSD) for Delta zero closing fee
+    scalper_offer_max_seconds_other: int = 840   # 14 min for other futures
 
 
 class FeesConfig(BaseModel):
@@ -147,6 +156,7 @@ class RiskConfig(BaseModel):
     leverage: LeverageConfig = Field(default_factory=LeverageConfig)
     stop_loss: StopLossConfig = Field(default_factory=StopLossConfig)
     take_profit: TakeProfitConfig = Field(default_factory=TakeProfitConfig)
+    trailing_stop: TrailingStopConfig = Field(default_factory=TrailingStopConfig)
     fees: FeesConfig = Field(default_factory=FeesConfig)
     daily_limits: DailyLimitsConfig = Field(default_factory=DailyLimitsConfig)
     failsafe: FailsafeConfig = Field(default_factory=FailsafeConfig)
