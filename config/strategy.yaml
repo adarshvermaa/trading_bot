@@ -1,0 +1,44 @@
+assets:
+  universe:
+    - BTCUSD
+    - ETHUSD
+  binance_symbol_map:
+    BTCUSD: btcusdt
+    ETHUSD: ethusdt
+
+timeframes:
+  - "15m"
+  - "5m"
+  - "1m"
+
+indicators:
+  ema_fast: 20
+  ema_slow: 50
+  rsi_period: 14
+  atr_period: 14
+  adx_period: 14
+  adx_threshold: 25
+  relative_volume_period: 20
+  relative_volume_threshold: 1.5
+
+structure:
+  min_swing_lookback: 10
+  bos_confirmation_candles: 2
+  choch_confirmation_candles: 2
+  liquidity_sweep_wick_ratio: 0.6
+  displacement_body_ratio: 0.7
+  retest_tolerance_atr_mult: 0.5
+
+ml:
+  model_path: "models/scalper_model.onnx"
+  min_confidence: 0.65
+  enabled: true
+
+scanner:
+  min_spread_bps: 10
+  min_volume_usd: 50000
+  score_weights:
+    structure: 0.35
+    regime: 0.20
+    indicators: 0.25
+    ml_confidence: 0.20
