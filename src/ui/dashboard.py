@@ -87,6 +87,18 @@ class Dashboard:
         btc_bias_col = "green" if btc_bias == "BULLISH" else ("red" if btc_bias == "BEARISH" else "yellow")
         table.add_row("BTC/USD Live", Text(f": {btc_delta_str}", style="bold green"))
 
+        btc_pdh = btc.get("pdh", 0.0)
+        btc_pdl = btc.get("pdl", 0.0)
+        btc_poc = btc.get("poc", 0.0)
+        if btc_pdh or btc_pdl:
+            htf_str = f"PDH=${btc_pdh:,.2f} | PDL=${btc_pdl:,.2f}" + (f" | POC=${btc_poc:,.2f}" if btc_poc else "")
+            table.add_row("BTC HTF Levels", Text(f": {htf_str}", style="cyan"))
+
+        if btc.get("squeeze_fired"):
+            table.add_row("BTC Squeeze", Text(": SQUEEZE FIRED! (Expansion)", style="bold green"))
+        elif btc.get("is_squeeze"):
+            table.add_row("BTC Squeeze", Text(": SQUEEZE ACTIVE (Compression)", style="bold yellow"))
+
         btc_s = btc.get("support", 0.0)
         btc_r = btc.get("resistance", 0.0)
         if btc_s or btc_r:
@@ -106,6 +118,18 @@ class Dashboard:
         eth_bias = eth.get("bias_15m") or "--"
         eth_bias_col = "green" if eth_bias == "BULLISH" else ("red" if eth_bias == "BEARISH" else "yellow")
         table.add_row("ETH/USD Live", Text(f": {eth_delta_str}", style="bold green"))
+
+        eth_pdh = eth.get("pdh", 0.0)
+        eth_pdl = eth.get("pdl", 0.0)
+        eth_poc = eth.get("poc", 0.0)
+        if eth_pdh or eth_pdl:
+            htf_str = f"PDH=${eth_pdh:,.2f} | PDL=${eth_pdl:,.2f}" + (f" | POC=${eth_poc:,.2f}" if eth_poc else "")
+            table.add_row("ETH HTF Levels", Text(f": {htf_str}", style="cyan"))
+
+        if eth.get("squeeze_fired"):
+            table.add_row("ETH Squeeze", Text(": SQUEEZE FIRED! (Expansion)", style="bold green"))
+        elif eth.get("is_squeeze"):
+            table.add_row("ETH Squeeze", Text(": SQUEEZE ACTIVE (Compression)", style="bold yellow"))
 
         eth_s = eth.get("support", 0.0)
         eth_r = eth.get("resistance", 0.0)
@@ -206,15 +230,19 @@ class Dashboard:
         ht_str = str(self.position_data.get('holding_time', '--'))
         table.add_row("Holding Time", f": {ht_str}")
 
-        # Delta Scalper 29m timer
-        holding_sec = 0.0
-        if ht_str.endswith('s') and ht_str[:-1].isdigit():
-            holding_sec = float(ht_str[:-1])
-        remaining = max(0.0, 1740.0 - holding_sec)
-        rem_min = int(remaining // 60)
-        rem_sec = int(remaining % 60)
-        rem_col = "green" if remaining > 300 else ("yellow" if remaining > 60 else "bold red")
-        table.add_row("Delta Scalper", Text(f": {rem_min}m {rem_sec:02d}s left (Zero Fee)", style=rem_col))
+        setup_p = self.position_data.get('setup_type', '')
+        if setup_p in ("HTF_BREAKOUT", "BREAKOUT_RETEST"):
+            table.add_row("Mode", Text(f": RUNNER ({setup_p} 2.5R+ Target)", style="bold magenta"))
+        else:
+            # Delta Scalper 29m timer
+            holding_sec = 0.0
+            if ht_str.endswith('s') and ht_str[:-1].isdigit():
+                holding_sec = float(ht_str[:-1])
+            remaining = max(0.0, 1740.0 - holding_sec)
+            rem_min = int(remaining // 60)
+            rem_sec = int(remaining % 60)
+            rem_col = "green" if remaining > 300 else ("yellow" if remaining > 60 else "bold red")
+            table.add_row("Delta Scalper", Text(f": {rem_min}m {rem_sec:02d}s left (Zero Fee)", style=rem_col))
 
         # Support/Resistance levels
         sup = self.position_data.get('nearest_support', 0)

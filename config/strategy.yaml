@@ -55,3 +55,12 @@ session:
   dead_zone_min_confidence: 0.75    # Heightened ML confidence during low-volume Asian chop
   standard_min_confidence: 0.65     # Standard ML confidence for London & NY Kill Zones
 
+breakout:
+  enabled: true                     # Enable institutional big-move breakout engine
+  squeeze_bb_mult: 2.0              # Bollinger Bands std dev multiplier
+  squeeze_kc_mult: 1.5              # Keltner Channels ATR multiplier
+  volume_expansion_mult: 2.0        # Volume spike threshold relative to 20-SMA volume
+  displacement_body_pct: 0.70       # Minimum body-to-range ratio for valid breakout displacement
+  runner_mode_enabled: true         # Enable trend runner mode (exempt from 29m limit in trending regime)
+  breakeven_r_mult: 2.0             # Move stop loss to breakeven (+0.1%) when profit >= 2.0R
+

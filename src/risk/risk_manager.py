@@ -126,9 +126,23 @@ class RiskManager:
                               contract_value: float, size: int, 
                               tick_size: Optional[float] = None,
                               structural_target: Optional[float] = None,
-                              sl_price: Optional[float] = None) -> float:
+                              sl_price: Optional[float] = None,
+                              setup_type: Optional[str] = None) -> float:
         is_long = side.upper() in ('LONG', 'BUY')
         
+        # Check for Institutional Breakout target (>= 2.5R expansion)
+        if setup_type in ("HTF_BREAKOUT", "BREAKOUT_RETEST"):
+            risk = abs(entry_price - sl_price) if (sl_price and sl_price > 0) else (entry_price * 0.03 / max(1, leverage))
+            breakout_target = (entry_price + 2.5 * risk) if is_long else max(0.0, entry_price - 2.5 * risk)
+            if structural_target and structural_target > 0:
+                if is_long and structural_target > breakout_target:
+                    breakout_target = structural_target
+                elif not is_long and structural_target < breakout_target:
+                    breakout_target = structural_target
+            if tick_size and tick_size > 0:
+                breakout_target = round_to_tick(breakout_target, tick_size, direction='UP' if is_long else 'DOWN')
+            return breakout_target
+
         # Check if structural target provides a sound Risk:Reward ratio (>= 1.5R)
         if structural_target and structural_target > 0:
             if is_long and structural_target > entry_price:
@@ -163,6 +177,49 @@ class RiskManager:
                 tp_price = round_to_tick(tp_price, tick_size, direction='DOWN')
             
         return tp_price
+
+    def check_breakeven_trigger(
+        self,
+        entry_price: float,
+        current_price: float,
+        side: str,
+        initial_sl: float,
+        current_sl: float,
+        tick_size: Optional[float] = None,
+        r_multiple: float = 2.0,
+        breakeven_buffer_pct: float = 0.001,
+    ) -> Tuple[float, bool, str]:
+        """Check if an active position has achieved >= 2.0R profit.
+        
+        If so, move Stop Loss to Breakeven (+0.1% buffer in favor of trade to cover fees).
+        Returns: (new_sl_price, updated, log_reason)
+        """
+        if entry_price <= 0 or initial_sl <= 0:
+            return current_sl, False, "Invalid entry or initial SL"
+
+        is_long = side.upper() in ('LONG', 'BUY')
+        initial_risk = abs(entry_price - initial_sl)
+        if initial_risk <= 0:
+            return current_sl, False, "Initial risk is zero"
+
+        if is_long:
+            unrealized_profit = current_price - entry_price
+            if unrealized_profit >= r_multiple * initial_risk:
+                be_sl = entry_price * (1.0 + breakeven_buffer_pct)
+                if tick_size and tick_size > 0:
+                    be_sl = round_to_tick(be_sl, tick_size, direction='UP')
+                if be_sl > current_sl:
+                    return be_sl, True, f"Achieved +{unrealized_profit/initial_risk:.2f}R profit! SL locked to Breakeven (${be_sl:,.2f})"
+        else:
+            unrealized_profit = entry_price - current_price
+            if unrealized_profit >= r_multiple * initial_risk:
+                be_sl = entry_price * (1.0 - breakeven_buffer_pct)
+                if tick_size and tick_size > 0:
+                    be_sl = round_to_tick(be_sl, tick_size, direction='DOWN')
+                if current_sl <= 0 or be_sl < current_sl:
+                    return be_sl, True, f"Achieved +{unrealized_profit/initial_risk:.2f}R profit! SL locked to Breakeven (${be_sl:,.2f})"
+
+        return current_sl, False, "Breakeven trigger not reached"
 
     def calculate_trailing_stop_loss(
         self,
@@ -252,11 +309,13 @@ class RiskManager:
     def calculate_sl_tp(self, side: str, entry_price: float, margin: float = 1000.0, leverage: int = 10, 
                         contract_value: float = 1.0, size: int = 1, atr: float = 100.0,
                         tick_size: Optional[float] = None,
-                        structural_target: Optional[float] = None) -> Tuple[float, float]:
+                        structural_target: Optional[float] = None,
+                        setup_type: Optional[str] = None) -> Tuple[float, float]:
         sl_price, _, _ = self.calculate_stop_loss(entry_price, side, margin, leverage, contract_value, size, atr, tick_size=tick_size)
         tp_price = self.calculate_take_profit(
             entry_price, side, margin, leverage, contract_value, size, 
-            tick_size=tick_size, structural_target=structural_target, sl_price=sl_price
+            tick_size=tick_size, structural_target=structural_target, sl_price=sl_price,
+            setup_type=setup_type,
         )
         return sl_price, tp_price
 

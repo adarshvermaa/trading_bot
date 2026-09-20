@@ -32,10 +32,14 @@ class ActiveOrder:
     product_id: Optional[int] = None
     last_event: Optional[str] = "CREATED"
     created_at: float = 0.0
+    initial_sl: Optional[float] = None
+    setup_type: str = "NONE"
 
     def __post_init__(self):
         if self.created_at == 0.0:
             self.created_at = time.time()
+        if self.initial_sl is None and self.sl_price is not None:
+            self.initial_sl = self.sl_price
 
 class OrderManager:
     def __init__(
@@ -111,6 +115,7 @@ class OrderManager:
         spread_bps: float = 0.0,
         equity: Optional[float] = None,
         structural_target_tp: Optional[float] = None,
+        setup_type: str = "NONE",
         **kwargs: Any,
     ) -> Optional[Dict[str, Any]]:
         if not client_order_id:
@@ -239,6 +244,7 @@ class OrderManager:
             atr=atr if atr is not None else 100.0,
             tick_size=tick_size,
             structural_target=structural_target_tp,
+            setup_type=setup_type,
         )
         final_sl = round_to_tick(sl_price if sl_price is not None else calc_sl, tick_size)
         final_tp = round_to_tick(tp_price if tp_price is not None else calc_tp, tick_size)
@@ -319,6 +325,8 @@ class OrderManager:
                     product_id=product_id,
                     last_event="ORDER_FILLED" if is_filled else "ORDER_PLACED",
                     created_at=time.time(),
+                    initial_sl=final_sl,
+                    setup_type=setup_type,
                 )
                 self.active_orders[order_id] = active_order
 

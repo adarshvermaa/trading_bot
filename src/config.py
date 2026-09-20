@@ -100,6 +100,16 @@ class AssetConfig(BaseModel):
     universe: list[str] = Field(default_factory=lambda: ["BTCUSD", "ETHUSD"])
 
 
+class BreakoutConfig(BaseModel):
+    enabled: bool = True
+    squeeze_bb_mult: float = 2.0
+    squeeze_kc_mult: float = 1.5
+    volume_expansion_mult: float = 2.0
+    displacement_body_pct: float = 0.70
+    runner_mode_enabled: bool = True
+    breakeven_r_mult: float = 2.0
+
+
 class StrategyConfig(BaseModel):
     assets: AssetConfig = Field(default_factory=AssetConfig)
     timeframes: list[str] = Field(default_factory=lambda: ["15m", "5m", "1m"])
@@ -109,6 +119,7 @@ class StrategyConfig(BaseModel):
     scanner: ScannerConfig = Field(default_factory=ScannerConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     session: SessionConfig = Field(default_factory=SessionConfig)
+    breakout: BreakoutConfig = Field(default_factory=BreakoutConfig)
 
 
 # ---------------------------------------------------------------------------

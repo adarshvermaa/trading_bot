@@ -1,7 +1,7 @@
 import numpy as np
 from dataclasses import dataclass
 from typing import List, Tuple, Any
-from src.strategy.structure import StructureAnalysis
+from src.strategy.structure import StructureAnalysis, calculate_volatility_squeeze, compute_volume_poc
 
 @dataclass
 class Signal:
@@ -22,6 +22,9 @@ class Signal:
     structural_target_tp: float = 0.0
 
 class SignalGenerator:
+    calculate_volatility_squeeze = staticmethod(calculate_volatility_squeeze)
+    compute_volume_poc = staticmethod(compute_volume_poc)
+
     def __init__(self, config: Any = None):
         self.config = config
 
@@ -252,8 +255,33 @@ class SignalGenerator:
         strength = 0.0
         setup_type = getattr(structure, "setup_type", "NONE")
 
+        # --- High-Accuracy Institutional Breakout Setups ---
+        if setup_type == "HTF_BREAKOUT":
+            breakout_dir = getattr(structure, "breakout_direction", "NONE")
+            if breakout_dir == "BULLISH":
+                direction = "LONG"
+                strength = 0.95
+                if pattern in ("HAMMER", "BULLISH_ENGULFING"):
+                    strength = 0.98
+            elif breakout_dir == "BEARISH":
+                direction = "SHORT"
+                strength = 0.95
+                if pattern in ("SHOOTING_STAR", "BEARISH_ENGULFING"):
+                    strength = 0.98
+        elif setup_type == "BREAKOUT_RETEST":
+            breakout_dir = getattr(structure, "breakout_direction", "NONE")
+            if breakout_dir == "BULLISH":
+                direction = "LONG"
+                strength = 0.90
+                if pattern in ("HAMMER", "BULLISH_ENGULFING"):
+                    strength = 0.95
+            elif breakout_dir == "BEARISH":
+                direction = "SHORT"
+                strength = 0.90
+                if pattern in ("SHOOTING_STAR", "BEARISH_ENGULFING"):
+                    strength = 0.95
         # --- High-Accuracy ICT Scalp Setups ---
-        if setup_type == "SWEEP_AND_FVG":
+        elif setup_type == "SWEEP_AND_FVG":
             fvg_d = getattr(structure, "fvg_direction", "NONE")
             if fvg_d == "BULLISH":
                 direction = "LONG"
@@ -322,22 +350,28 @@ class SignalGenerator:
             (structure.bias_15m == ema_cross)
             or (direction == "LONG" and ema_cross == "BULLISH")
             or (direction == "SHORT" and ema_cross == "BEARISH")
-            or (setup_type in ("SWEEP_REVERSAL", "SWEEP_AND_FVG", "FVG_RETEST") and direction in ("LONG", "SHORT"))
+            or (setup_type in ("SWEEP_REVERSAL", "SWEEP_AND_FVG", "FVG_RETEST", "HTF_BREAKOUT", "BREAKOUT_RETEST") and direction in ("LONG", "SHORT"))
         )
 
         # Structural liquidity Take Profit targets
         structural_target_tp = 0.0
-        if direction == "LONG" and structure.nearest_resistance > last_close:
+        if setup_type in ("HTF_BREAKOUT", "BREAKOUT_RETEST"):
+            if direction == "LONG":
+                structural_target_tp = max(last_close * 1.04, float(structure.nearest_resistance) if structure.nearest_resistance > last_close else 0.0)
+            elif direction == "SHORT":
+                structural_target_tp = min(last_close * 0.96, float(structure.nearest_support) if structure.nearest_support > 0.0 else last_close * 0.96)
+        elif direction == "LONG" and structure.nearest_resistance > last_close:
             structural_target_tp = float(structure.nearest_resistance)
         elif direction == "SHORT" and structure.nearest_support > 0.0 and structure.nearest_support < last_close:
             structural_target_tp = float(structure.nearest_support)
 
+        is_breakout = setup_type in ("HTF_BREAKOUT", "BREAKOUT_RETEST")
         return Signal(
             direction=direction,
-            strength=strength if (structure.is_valid or setup_type in ("SWEEP_REVERSAL", "SWEEP_AND_FVG", "FVG_RETEST")) else 0.0,
+            strength=strength if (structure.is_valid or setup_type in ("SWEEP_REVERSAL", "SWEEP_AND_FVG", "FVG_RETEST", "HTF_BREAKOUT", "BREAKOUT_RETEST")) else 0.0,
             entry_price=last_close,
             sl_price=last_close * 0.99 if direction == 'LONG' else last_close * 1.01,
-            tp_price=last_close * 1.02 if direction == 'LONG' else last_close * 0.98,
+            tp_price=(last_close * 1.04 if direction == 'LONG' else last_close * 0.96) if is_breakout else (last_close * 1.02 if direction == 'LONG' else last_close * 0.98),
             ema_cross=ema_cross,
             vwap_position=vwap_pos,
             rsi=float(rsi[-1]),
@@ -446,3 +480,7 @@ calculate_rsi = SignalGenerator.calculate_rsi
 compute_rsi = SignalGenerator.calculate_rsi
 calculate_relative_volume = SignalGenerator.calculate_relative_volume
 compute_relative_volume = SignalGenerator.calculate_relative_volume
+calculate_volatility_squeeze = SignalGenerator.calculate_volatility_squeeze
+compute_volatility_squeeze = SignalGenerator.calculate_volatility_squeeze
+calculate_volume_poc = SignalGenerator.compute_volume_poc
+compute_volume_poc = SignalGenerator.compute_volume_poc

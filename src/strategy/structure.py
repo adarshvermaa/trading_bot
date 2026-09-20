@@ -28,12 +28,102 @@ class StructureAnalysis:
     fvg_top: float = 0.0
     fvg_bottom: float = 0.0
     fvg_testing: bool = False
+    pdh: float = 0.0
+    pdl: float = 0.0
+    poc: float = 0.0
+    is_squeeze: bool = False
+    squeeze_fired: bool = False
+    breakout_level: float = 0.0
+    breakout_direction: str = "NONE"
 
     def __post_init__(self):
         if self.support_levels is None:
             self.support_levels = []
         if self.resistance_levels is None:
             self.resistance_levels = []
+
+
+def calculate_volatility_squeeze(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    bb_period: int = 20,
+    bb_mult: float = 2.0,
+    kc_period: int = 20,
+    kc_mult: float = 1.5,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """John Carter Volatility Squeeze indicator.
+    
+    Bollinger Bands (period, bb_mult) vs Keltner Channels (period, kc_mult * ATR).
+    - is_squeeze: True when BB is entirely inside KC (Upper BB < Upper KC and Lower BB > Lower KC)
+    - squeeze_fired: True when previous bar was in squeeze and current bar is no longer squeezed
+    Returns: (is_squeeze: np.ndarray[bool], squeeze_fired: np.ndarray[bool])
+    """
+    n = len(close)
+    is_squeeze = np.zeros(n, dtype=bool)
+    squeeze_fired = np.zeros(n, dtype=bool)
+    period = max(bb_period, kc_period)
+    if n < period:
+        return is_squeeze, squeeze_fired
+
+    pad = bb_period - 1
+    sma = np.convolve(close, np.ones(bb_period) / bb_period, mode='valid')
+
+    stds = np.array([np.std(close[i - pad : i + 1]) for i in range(pad, n)])
+    upper_bb = sma + bb_mult * stds
+    lower_bb = sma - bb_mult * stds
+
+    tr = np.zeros(n)
+    tr[0] = high[0] - low[0]
+    for i in range(1, n):
+        tr[i] = max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1]))
+
+    atr = np.zeros(n)
+    atr[0] = tr[0]
+    for i in range(1, n):
+        atr[i] = (atr[i - 1] * (kc_period - 1) + tr[i]) / kc_period
+
+    upper_kc = sma + kc_mult * atr[pad:]
+    lower_kc = sma - kc_mult * atr[pad:]
+
+    squeeze_slice = (upper_bb < upper_kc) & (lower_bb > lower_kc)
+    is_squeeze[pad:] = squeeze_slice
+
+    for i in range(pad + 1, n):
+        if is_squeeze[i - 1] and not is_squeeze[i]:
+            squeeze_fired[i] = True
+
+    return is_squeeze, squeeze_fired
+
+
+def compute_volume_poc(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    volume: np.ndarray,
+    num_bins: int = 30,
+) -> float:
+    """Calculate Volume Point of Control (POC) across given price/volume arrays."""
+    if len(close) == 0 or len(volume) == 0:
+        return 0.0
+    min_p = float(np.min(low))
+    max_p = float(np.max(high))
+    if min_p >= max_p:
+        return float(close[-1])
+
+    bin_edges = np.linspace(min_p, max_p, num_bins + 1)
+    bin_volumes = np.zeros(num_bins, dtype=float)
+    candle_mids = (high + low + close) / 3.0
+
+    for mid, vol in zip(candle_mids, volume):
+        b_idx = int((mid - min_p) / (max_p - min_p) * num_bins)
+        b_idx = min(max(b_idx, 0), num_bins - 1)
+        bin_volumes[b_idx] += float(vol)
+
+    max_idx = int(np.argmax(bin_volumes))
+    poc = (bin_edges[max_idx] + bin_edges[max_idx + 1]) / 2.0
+    return float(poc)
+
 
 class MarketStructure:
     def __init__(
@@ -51,12 +141,21 @@ class MarketStructure:
             self.displacement_threshold = getattr(config, "displacement_body_ratio", getattr(config, "displacement_threshold", 0.7))
             self.retest_tolerance_mult = getattr(config, "retest_tolerance_atr_mult", getattr(config, "retest_tolerance_mult", 0.5))
             self.fvg_min_atr_mult = getattr(config, "fvg_min_atr_mult", fvg_min_atr_mult)
+            breakout_cfg = getattr(config, "breakout", None)
+            self.squeeze_bb_mult = getattr(breakout_cfg, "squeeze_bb_mult", 2.0) if breakout_cfg else 2.0
+            self.squeeze_kc_mult = getattr(breakout_cfg, "squeeze_kc_mult", 1.5) if breakout_cfg else 1.5
+            self.volume_expansion_mult = getattr(breakout_cfg, "volume_expansion_mult", 2.0) if breakout_cfg else 2.0
+            self.displacement_body_pct = getattr(breakout_cfg, "displacement_body_pct", 0.70) if breakout_cfg else 0.70
         else:
             self.lookback = config if isinstance(config, int) else lookback
             self.wick_ratio_threshold = wick_ratio_threshold
             self.displacement_threshold = displacement_threshold
             self.retest_tolerance_mult = retest_tolerance_mult
             self.fvg_min_atr_mult = fvg_min_atr_mult
+            self.squeeze_bb_mult = 2.0
+            self.squeeze_kc_mult = 1.5
+            self.volume_expansion_mult = 2.0
+            self.displacement_body_pct = 0.70
 
     def _extract_arrays(self, candles: Any) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if not candles:
@@ -173,11 +272,29 @@ class MarketStructure:
 
         return False, "NONE", 0.0, 0.0, False
 
-    def analyze(self, candles_15m: List[Any], candles_5m: List[Any], candles_1m: List[Any], atr_1m: float) -> StructureAnalysis:
+    def analyze(
+        self,
+        candles_15m: List[Any],
+        candles_5m: List[Any],
+        candles_1m: List[Any],
+        atr_1m: float,
+        htf_levels: Optional[Any] = None,
+    ) -> StructureAnalysis:
         logger.info("Analyzing market structure across timeframes")
         
         # 15m analysis
         op_15, hi_15, lo_15, cl_15, vol_15 = self._extract_arrays(candles_15m)
+
+        # Higher-Timeframe (HTF) S/R & POC Levels
+        pdh = float(htf_levels.get("PDH", 0.0)) if (htf_levels and isinstance(htf_levels, dict)) else 0.0
+        pdl = float(htf_levels.get("PDL", 0.0)) if (htf_levels and isinstance(htf_levels, dict)) else 0.0
+        poc = float(htf_levels.get("POC", 0.0)) if (htf_levels and isinstance(htf_levels, dict)) else 0.0
+
+        if (pdh == 0.0 or pdl == 0.0) and len(cl_15) >= 20:
+            pdh = float(np.max(hi_15))
+            pdl = float(np.min(lo_15))
+            poc = compute_volume_poc(hi_15, lo_15, cl_15, vol_15)
+
         bias_15m = 'NEUTRAL'
         lookback_15 = min(self.lookback, 4)
         if len(hi_15) > 2 * lookback_15:
@@ -378,9 +495,89 @@ class MarketStructure:
                 hi_5, lo_5, cl_5, atr=atr_1m * 2.0
             )
 
-        # Determine Setup Type with high-probability ICT confluence
+        # Volatility Squeeze detection
+        is_squeeze = False
+        squeeze_fired = False
+        if len(cl_5) >= 20:
+            is_sq_5, sq_fired_5 = calculate_volatility_squeeze(
+                hi_5, lo_5, cl_5, bb_mult=self.squeeze_bb_mult, kc_mult=self.squeeze_kc_mult
+            )
+            is_squeeze = bool(is_sq_5[-1])
+            squeeze_fired = bool(sq_fired_5[-1])
+        elif len(cl_1) >= 20:
+            is_sq_1, sq_fired_1 = calculate_volatility_squeeze(
+                hi_1, lo_1, cl_1, bb_mult=self.squeeze_bb_mult, kc_mult=self.squeeze_kc_mult
+            )
+            is_squeeze = bool(is_sq_1[-1])
+            squeeze_fired = bool(sq_fired_1[-1])
+
+        # Integrate POC into key S/R levels
+        if poc > 0.0:
+            if len(cl_1) > 0:
+                cur_p = cl_1[-1]
+                if cur_p >= poc and poc not in support_levels_list:
+                    support_levels_list.append(poc)
+                    support_levels_list.sort()
+                elif cur_p < poc and poc not in resistance_levels_list:
+                    resistance_levels_list.append(poc)
+                    resistance_levels_list.sort()
+                if abs(cur_p - poc) <= (atr_1m * 1.5):
+                    at_key_level = True
+
+        # HTF Breakout & Retest Detection
+        breakout_direction = "NONE"
+        breakout_level = 0.0
+        breakout_detected = False
+        retest_detected = False
+
+        if len(cl_1) >= 2:
+            cur_c = cl_1[-1]
+            prev_c = cl_1[-2]
+            cur_vol = vol_1[-1] if len(vol_1) > 0 else 0.0
+            avg_vol_20 = float(np.mean(vol_1[-20:])) if len(vol_1) >= 20 else (float(np.mean(vol_1)) if len(vol_1) > 0 else 1.0)
+            rel_vol_1m = (cur_vol / avg_vol_20) if avg_vol_20 > 0 else 1.0
+
+            # Bullish Breakout above PDH
+            if pdh > 0 and cur_c > pdh and (prev_c <= pdh or (len(cl_1) >= 3 and cl_1[-3] <= pdh)):
+                if (rel_vol_1m >= (self.volume_expansion_mult * 0.9) or is_squeeze or squeeze_fired) and displacement_1m:
+                    breakout_detected = True
+                    breakout_direction = "BULLISH"
+                    breakout_level = pdh
+            # Bearish Breakout below PDL
+            elif pdl > 0 and cur_c < pdl and (prev_c >= pdl or (len(cl_1) >= 3 and cl_1[-3] >= pdl)):
+                if (rel_vol_1m >= (self.volume_expansion_mult * 0.9) or is_squeeze or squeeze_fired) and displacement_1m:
+                    breakout_detected = True
+                    breakout_direction = "BEARISH"
+                    breakout_level = pdl
+
+            # Breakout Retest of broken level
+            if not breakout_detected and len(cl_1) >= 5:
+                # Bullish Retest of PDH
+                if pdh > 0 and np.max(hi_1[-10:]) > pdh:
+                    if abs(cur_c - pdh) <= (atr_1m * 0.8) or (lo_1[-1] <= pdh <= cur_c):
+                        if cur_c >= op_1[-1]:  # Bullish reaction
+                            retest_detected = True
+                            breakout_direction = "BULLISH"
+                            breakout_level = pdh
+                # Bearish Retest of PDL
+                elif pdl > 0 and np.min(lo_1[-10:]) < pdl:
+                    if abs(cur_c - pdl) <= (atr_1m * 0.8) or (cur_c <= pdl <= hi_1[-1]):
+                        if cur_c <= op_1[-1]:  # Bearish reaction
+                            retest_detected = True
+                            breakout_direction = "BEARISH"
+                            breakout_level = pdl
+
+        # Determine Setup Type with high-probability ICT and HTF Breakout confluence
         setup_type = "NONE"
-        if liquidity_sweep_5m and fvg_detected and sweep_direction == fvg_dir:
+        if breakout_detected:
+            setup_type = "HTF_BREAKOUT"
+            is_valid = True
+            invalidation_reason = None
+        elif retest_detected:
+            setup_type = "BREAKOUT_RETEST"
+            is_valid = True
+            invalidation_reason = None
+        elif liquidity_sweep_5m and fvg_detected and sweep_direction == fvg_dir:
             # Swept liquidity, displaced into an FVG, and returning: Ultimate ICT Setup
             setup_type = "SWEEP_AND_FVG"
             is_valid = True
@@ -424,4 +621,11 @@ class MarketStructure:
             fvg_top=fvg_top,
             fvg_bottom=fvg_bottom,
             fvg_testing=fvg_testing,
+            pdh=pdh,
+            pdl=pdl,
+            poc=poc,
+            is_squeeze=is_squeeze,
+            squeeze_fired=squeeze_fired,
+            breakout_level=breakout_level,
+            breakout_direction=breakout_direction,
         )

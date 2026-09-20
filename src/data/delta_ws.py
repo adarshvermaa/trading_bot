@@ -6,6 +6,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Set, Tuple, Optional, Any
 import aiohttp
+import numpy as np
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
@@ -87,6 +88,9 @@ class DeltaWSClient:
         # Set of seen closed candles: (symbol, timeframe, open_time)
         self._seen_candles: Set[Tuple[str, str, int]] = set()
 
+        # HTF levels cache: symbol -> {"PDH": ..., "PDL": ..., "PDC": ..., "POC": ...}
+        self._htf_levels: Dict[str, Dict[str, float]] = {}
+
     @property
     def candle_store(self) -> CandleStore:
         """Alias for self.store."""
@@ -129,6 +133,66 @@ class DeltaWSClient:
     def get_latest_quotes(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Get best bid / best ask quotes from v2/ticker."""
         return self._latest_quotes.get(symbol.upper(), self._latest_quotes.get(symbol))
+
+    @staticmethod
+    def calculate_htf_levels(candles: List[Candle]) -> Dict[str, float]:
+        """Calculate Previous Day High (PDH), Low (PDL), Close (PDC), and Volume POC.
+        
+        Uses closed candles across the recent 24h-48h window.
+        """
+        if not candles:
+            return {"PDH": 0.0, "PDL": 0.0, "PDC": 0.0, "POC": 0.0}
+
+        # Window: last 24 candles if 1h, or last 96 candles if 15m
+        window = candles[-25:-1] if len(candles) >= 25 else candles
+        if not window:
+            window = candles
+
+        pdh = float(max(c.high for c in window))
+        pdl = float(min(c.low for c in window))
+        pdc = float(window[-1].close)
+
+        # Volume POC (Point of Control) calculation across window
+        num_bins = 30
+        if pdh > pdl and len(window) > 0:
+            bin_width = (pdh - pdl) / num_bins
+            bin_volumes = [0.0] * num_bins
+            for c in window:
+                typ_price = (c.high + c.low + c.close) / 3.0
+                bin_idx = min(num_bins - 1, max(0, int((typ_price - pdl) / bin_width)))
+                bin_volumes[bin_idx] += c.volume
+            max_bin = int(np.argmax(bin_volumes))
+            poc = pdl + (max_bin + 0.5) * bin_width
+        else:
+            poc = (pdh + pdl) / 2.0 if (pdh > 0 and pdl > 0) else 0.0
+
+        return {
+            "PDH": round(pdh, 2),
+            "PDL": round(pdl, 2),
+            "PDC": round(pdc, 2),
+            "POC": round(float(poc), 2),
+        }
+
+    def get_htf_levels(self, symbol: str) -> Dict[str, float]:
+        """Get calculated HTF levels (PDH, PDL, PDC, POC) for a symbol."""
+        sym_upper = symbol.upper()
+        if sym_upper in self._htf_levels and self._htf_levels[sym_upper].get("PDH", 0.0) > 0:
+            return self._htf_levels[sym_upper]
+
+        # Calculate from 1h candles if present, or fallback to 15m candles
+        c_1h = self.store.get_candles(sym_upper, "1h")
+        if c_1h and len(c_1h) >= 10:
+            levels = self.calculate_htf_levels(c_1h)
+            self._htf_levels[sym_upper] = levels
+            return levels
+
+        c_15m = self.store.get_candles(sym_upper, "15m")
+        if c_15m:
+            levels = self.calculate_htf_levels(c_15m)
+            self._htf_levels[sym_upper] = levels
+            return levels
+
+        return {"PDH": 0.0, "PDL": 0.0, "PDC": 0.0, "POC": 0.0}
 
     @staticmethod
     def _resolution_seconds(resolution: str) -> int:
@@ -373,14 +437,17 @@ class DeltaWSClient:
         stale_monitor_task.cancel()
         heartbeat_task.cancel()
 
-    async def bootstrap_historical_candles(self, limit: int = 100) -> int:
+    async def bootstrap_historical_candles(
+        self, limit: int = 100, timeframes: Optional[List[str]] = None
+    ) -> int:
         """
         Pre-seed CandleStore with historical closed candles directly from Delta Exchange REST API.
         GET /v2/history/candles?symbol={symbol}&resolution={tf}&start={start}&end={end}
         Ensures market structure and indicator requirements (>= 50 candles) are immediately met.
         """
         total_bootstrapped = 0
-        logger.info(f"Bootstrapping {limit} historical candles from Delta Exchange for {self.symbols} across {self.timeframes}...")
+        target_tfs = timeframes if timeframes is not None else self.timeframes
+        logger.info(f"Bootstrapping historical candles from Delta Exchange for {self.symbols} across {target_tfs}...")
 
         headers = {
             "User-Agent": "python-scalping-bot",
@@ -390,7 +457,7 @@ class DeltaWSClient:
         async with aiohttp.ClientSession(headers=headers) as session:
             tasks = []
             for sym in self.symbols:
-                for tf in self.timeframes:
+                for tf in target_tfs:
                     tasks.append(self._fetch_delta_klines(session, sym, tf, limit))
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -400,6 +467,10 @@ class DeltaWSClient:
                 elif isinstance(res, Exception):
                     logger.debug(f"Historical candle task failed: {res}")
 
+        # Compute HTF levels for all symbols
+        for sym in self.symbols:
+            self.get_htf_levels(sym)
+
         if total_bootstrapped > 0:
             self._last_message_time = time.time()
             self.new_candle_event.set()
@@ -408,6 +479,23 @@ class DeltaWSClient:
             logger.warning("No historical candles bootstrapped from Delta Exchange. Strategy will wait for live WebSocket candles.")
 
         return total_bootstrapped
+
+    async def bootstrap_htf_candles(self, limit: int = 48) -> int:
+        """Fetch 1h candles specifically for higher-timeframe S/R levels."""
+        total = 0
+        headers = {"User-Agent": "python-scalping-bot", "Content-Type": "application/json"}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            tasks = [self._fetch_delta_klines(session, sym, "1h", limit) for sym in self.symbols]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, int):
+                    total += res
+                elif isinstance(res, Exception):
+                    logger.debug(f"HTF historical candle task failed: {res}")
+
+        for sym in self.symbols:
+            self.get_htf_levels(sym)
+        return total
 
     async def _fetch_delta_klines(self, session: aiohttp.ClientSession, symbol: str, resolution: str, limit: int) -> int:
         sym_upper = symbol.upper()

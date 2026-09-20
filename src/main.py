@@ -235,7 +235,15 @@ class ScalpingBot:
                 max_holding_sec = getattr(trailing_cfg, "scalper_offer_max_seconds_major", 1740) if symbol in ("BTCUSD", "ETHUSD") else getattr(trailing_cfg, "scalper_offer_max_seconds_other", 840)
                 position_age = time.time() - getattr(active, "created_at", time.time())
 
-                if position_age >= max_holding_sec:
+                # Check if this position is an institutional breakout runner
+                breakout_cfg = getattr(getattr(self.config, "strategy", None), "breakout", None)
+                is_breakout_runner = (
+                    breakout_cfg and getattr(breakout_cfg, "runner_mode_enabled", False)
+                    and getattr(active, "setup_type", "") in ("HTF_BREAKOUT", "BREAKOUT_RETEST")
+                    and getattr(self, "_current_regime", "RANGING") == "TRENDING"
+                )
+
+                if position_age >= max_holding_sec and not is_breakout_runner:
                     logger.info(
                         f"Delta Scalper Offer limit reached for {symbol} ({position_age:.0f}s >= {max_holding_sec}s). "
                         f"Closing position at {live_price:.2f} to guarantee zero closing fee."
@@ -255,7 +263,7 @@ class ScalpingBot:
                     self._re_entry_cooldown_until = time.time() + 5.0
                     continue
 
-                # --- 1b. Dynamic Stepped Trailing Stop Loss on Margin P&L ---
+                # --- 1b. Dynamic Stepped Trailing Stop Loss on Margin P&L & Breakeven Locking ---
                 if product_id:
                     product = await self.delta_client.get_product(symbol)
                     cv = float(product.get("contract_value", 1.0)) if product else 1.0
@@ -263,6 +271,31 @@ class ScalpingBot:
                     pos_entry = self.account_manager.positions.get(symbol) if self.account_manager else None
                     margin = pos_entry.margin if (pos_entry and pos_entry.margin > 0) else (active.entry_price * active.size * cv / max(1, self.config.risk.leverage.high_leverage_value))
 
+                    # 1b-i. Check Breakeven Trigger (lock SL to entry +0.1% buffer when profit >= 2.0R)
+                    be_r_mult = getattr(breakout_cfg, "breakeven_r_mult", 2.0) if breakout_cfg else 2.0
+                    initial_sl_val = getattr(active, "initial_sl", None) or active.sl_price or 0.0
+                    be_sl, be_updated, be_msg = self.risk_manager.check_breakeven_trigger(
+                        entry_price=active.entry_price,
+                        current_price=live_price,
+                        side=active.side,
+                        initial_sl=initial_sl_val,
+                        current_sl=active.sl_price or 0.0,
+                        tick_size=tick_size,
+                        r_multiple=be_r_mult,
+                    )
+                    if be_updated:
+                        self.order_manager.update_active_sl(be_sl)
+                        await self.delta_client.update_bracket_stop_loss(
+                            product_id,
+                            be_sl,
+                            tick_size,
+                            order_id=active.order_id,
+                            side=active.side,
+                            size=active.size,
+                        )
+                        logger.info(f"[BREAKEVEN SL] {symbol}: {be_msg}")
+
+                    # 1b-ii. Dynamic Stepped Trailing Stop Loss on Margin P&L
                     new_sl, updated, msg = self.risk_manager.calculate_trailing_stop_loss(
                         entry_price=active.entry_price,
                         side=active.side,
@@ -418,9 +451,10 @@ class ScalpingBot:
                                      self.config.strategy.indicators.atr_period)
             current_atr = float(atr_values[-1]) if len(atr_values) > 0 else 0.0
 
+            htf_levels = self.delta_ws.get_htf_levels(symbol) if hasattr(self, "delta_ws") and self.delta_ws else None
             try:
                 structure = self.market_structure.analyze(
-                    arr_15m, arr_5m, arr_1m, current_atr
+                    arr_15m, arr_5m, arr_1m, current_atr, htf_levels=htf_levels
                 )
             except Exception:
                 logger.debug(f"Structure analysis failed for {symbol}", exc_info=True)
@@ -440,6 +474,7 @@ class ScalpingBot:
             avg_atr = float(np.mean(atr_values[-20:])) if len(atr_values) >= 20 else current_atr
 
             regime = self.regime_filter.evaluate(current_adx, current_atr, avg_atr)
+            self._current_regime = regime.name
 
             # Session evaluation & adaptive confidence
             session_cfg = getattr(self.config.strategy, "session", None)
@@ -538,6 +573,12 @@ class ScalpingBot:
                 "actionable": e["is_actionable"],
                 "setup_type": getattr(e["structure"], "setup_type", "NONE"),
                 "pattern": getattr(e["signal"], "pattern", "NONE"),
+                "pdh": getattr(e["structure"], "pdh", 0.0),
+                "pdl": getattr(e["structure"], "pdl", 0.0),
+                "poc": getattr(e["structure"], "poc", 0.0),
+                "is_squeeze": getattr(e["structure"], "is_squeeze", False),
+                "squeeze_fired": getattr(e["structure"], "squeeze_fired", False),
+                "breakout_direction": getattr(e["structure"], "breakout_direction", "NONE"),
             }
         self._market_watch = market_watch
 
@@ -654,9 +695,10 @@ class ScalpingBot:
                             )
                             cur_atr = float(atr_vals[-1]) if len(atr_vals) > 0 else 0.0
 
+                            htf_lvl = self.delta_ws.get_htf_levels(active.symbol) if hasattr(self, "delta_ws") and self.delta_ws else None
                             try:
                                 struct = self.market_structure.analyze(
-                                    to_arr(candles_15m), to_arr(candles_5m), a1m, cur_atr
+                                    to_arr(candles_15m), to_arr(candles_5m), a1m, cur_atr, htf_levels=htf_lvl
                                 )
                                 # Update S/R levels from live structure analysis
                                 self._nearest_support = struct.nearest_support
@@ -760,6 +802,7 @@ class ScalpingBot:
                                 equity=self.account_manager.equity,
                                 order_type=chosen_order_type,
                                 structural_target_tp=getattr(setup["signal"], "structural_target_tp", None),
+                                setup_type=getattr(setup["signal"], "setup_type", "NONE"),
                             )
 
                             self._position_health = "STRONG"
