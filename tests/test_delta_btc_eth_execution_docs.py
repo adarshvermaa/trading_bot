@@ -119,9 +119,10 @@ async def test_update_bracket_stop_loss_delta_docs_compliance():
         )
 
         assert res["success"] is True
-        mock_req.assert_called_once()
-        call_method, call_path = mock_req.call_args[0][0], mock_req.call_args[0][1]
-        call_body = mock_req.call_args[1].get("body", {})
+        # First call is GET /v2/orders (check resting stop orders), second is PUT /v2/orders/bracket fallback
+        put_call = next(c for c in mock_req.call_args_list if c[0][0] == "PUT")
+        call_method, call_path = put_call[0][0], put_call[0][1]
+        call_body = put_call[1].get("body", {})
 
         assert call_method == "PUT"
         assert call_path == "/v2/orders/bracket"
@@ -175,7 +176,7 @@ async def test_signal_to_delta_order_manager_execution():
     # Check portfolio position has correct contract value multiplier (0.001)
     pos = account_manager.positions.get("BTCUSD")
     assert pos is not None
-    assert pos.leverage == 150
+    assert pos.leverage == config.risk.leverage.high_leverage_value
 
     await delta_client.close()
 

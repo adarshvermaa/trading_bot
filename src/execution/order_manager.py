@@ -391,13 +391,22 @@ class OrderManager:
                     await self.delta_client.close_position(product_id, target.side, target.size)
                 except Exception as e:
                     logger.error(f"Failed to close live position: {e}")
+            exit_p = close_price if (close_price and close_price > 0) else target.entry_price
+            cv = contract_value or 1.0
+            if target.side.upper() in ("BUY", "LONG"):
+                pnl = (exit_p - target.entry_price) * target.size * cv
+            else:
+                pnl = (target.entry_price - exit_p) * target.size * cv
+            if self.account_manager and symbol in self.account_manager.positions:
+                self.account_manager.positions.pop(symbol, None)
 
         # Record in risk manager
         self.risk_manager.record_trade_result(pnl)
 
         # Update order state
+        pnl_str = f"+${pnl:,.2f}" if pnl >= 0 else f"-${abs(pnl):,.2f}"
         target.state = OrderState.CLOSED
-        target.last_event = reason
+        target.last_event = f"{reason} ({pnl_str})"
 
         self.last_closed_order = {
             "order_id": target.order_id,

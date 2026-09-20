@@ -553,13 +553,19 @@ class DeltaExchangeClient:
 
     async def close_position(self, product_id: int, side_to_close: str, size: float) -> Dict[str, Any]:
         side = "sell" if side_to_close.lower() in ("buy", "long") else "buy"
-        return await self.place_order(
+        res = await self.place_order(
             product_id=product_id,
             side=side,
             size=size,
             order_type="market",
             reduce_only=True
         )
+        if self.live_trading:
+            try:
+                await self.cancel_all_orders(product_id=int(product_id))
+            except Exception as e:
+                logger.debug(f"Failed to cancel remaining orders after position close for product {product_id}: {e}")
+        return res
 
     def check_paper_sl_tp(self, product_id: int, current_price: float) -> Optional[str]:
         """Check if paper SL or TP has been hit. Returns 'SL_HIT', 'TP_HIT', or None."""
@@ -631,7 +637,13 @@ class DeltaExchangeClient:
             self.paper_account.positions[product_id].bracket_sl = new_sl
 
     async def update_bracket_stop_loss(
-        self, product_id: int, new_sl: float, tick_size: Optional[float] = None, order_id: Optional[str] = None
+        self,
+        product_id: int,
+        new_sl: float,
+        tick_size: Optional[float] = None,
+        order_id: Optional[str] = None,
+        side: Optional[str] = None,
+        size: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Update the bracket stop loss price on Delta Exchange (or paper position)."""
         if tick_size and tick_size > 0:
@@ -645,23 +657,76 @@ class DeltaExchangeClient:
         if int(product_id) in self.products_by_id_cache:
             prod_symbol = self.products_by_id_cache[int(product_id)].get("symbol", prod_symbol)
 
-        body: Dict[str, Any] = {
+        formatted_sl = format_price(new_sl, tick_size) if (tick_size and tick_size > 0) else str(new_sl)
+
+        # 1. Primary path in live mode: Find resting stop-loss order on Delta and update via PUT /v2/orders
+        try:
+            open_orders = await self.get_open_orders(product_id=int(product_id))
+            if isinstance(open_orders, list):
+                sl_order = next(
+                    (
+                        o for o in open_orders
+                        if isinstance(o, dict)
+                        and o.get("stop_order_type") == "stop_loss_order"
+                        and str(o.get("state", "")).lower() in ("open", "pending")
+                    ),
+                    None,
+                )
+                if sl_order and "id" in sl_order:
+                    edit_body = {
+                        "id": int(sl_order["id"]),
+                        "product_id": int(product_id),
+                        "stop_price": formatted_sl,
+                    }
+                    res = await self._request("PUT", "/v2/orders", body=edit_body, weight=5)
+                    logger.info(f"Updated resting stop-loss order {sl_order['id']} on Delta to {formatted_sl}")
+                    return {"success": True, "result": res, "bracket_stop_loss_price": new_sl}
+        except Exception as e:
+            logger.debug(f"Could not edit resting stop-loss order via PUT /v2/orders: {e}")
+
+        # 2. Fallback: Try PUT /v2/orders/bracket (in case entry order is still pending/unfilled)
+        bracket_body: Dict[str, Any] = {
             "product_id": int(product_id),
             "product_symbol": prod_symbol,
-            "bracket_stop_loss_price": format_price(new_sl, tick_size) if (tick_size and tick_size > 0) else str(new_sl),
+            "bracket_stop_loss_price": formatted_sl,
             "bracket_stop_trigger_method": "last_traded_price",
         }
         if order_id:
             try:
-                body["id"] = int(order_id)
+                bracket_body["id"] = int(order_id)
             except ValueError:
                 pass
 
         try:
-            return await self._request("PUT", "/v2/orders/bracket", body=body, weight=5)
+            res = await self._request("PUT", "/v2/orders/bracket", body=bracket_body, weight=5)
+            logger.info(f"Updated bracket stop loss via PUT /v2/orders/bracket to {formatted_sl}")
+            return {"success": True, "result": res, "bracket_stop_loss_price": new_sl}
         except Exception as e:
-            logger.warning(f"Failed to update Delta bracket stop loss via PUT /v2/orders/bracket: {e}")
-            return {"success": False, "error": str(e)}
+            logger.debug(f"PUT /v2/orders/bracket fallback failed: {e}")
+
+        # 3. Fallback: If position is open on Delta but no stop order exists, place a new conditional stop order
+        if side and size and size > 0:
+            sl_side = "sell" if side.lower() in ("buy", "long") else "buy"
+            new_sl_body: Dict[str, Any] = {
+                "product_id": int(product_id),
+                "product_symbol": prod_symbol,
+                "side": sl_side,
+                "size": max(1, int(round(size))),
+                "order_type": "market_order",
+                "stop_order_type": "stop_loss_order",
+                "stop_price": formatted_sl,
+                "stop_trigger_method": "last_traded_price",
+                "reduce_only": True,
+                "time_in_force": "gtc",
+            }
+            try:
+                res = await self._request("POST", "/v2/orders", body=new_sl_body, weight=5)
+                logger.info(f"Placed new resting stop-loss order on Delta at {formatted_sl}")
+                return {"success": True, "result": res, "bracket_stop_loss_price": new_sl}
+            except Exception as e:
+                logger.warning(f"Failed to place new stop-loss order via POST /v2/orders: {e}")
+
+        return {"success": False, "error": "Failed to update or place stop loss on Delta Exchange"}
 
     async def ws_connect(self):
         if not self.live_trading or not self.api_key or not self.api_secret:

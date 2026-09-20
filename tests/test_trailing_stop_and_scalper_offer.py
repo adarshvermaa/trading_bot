@@ -201,3 +201,116 @@ def test_delta_scalper_offer_29m_limit():
     created_at_29m = now - (29 * 60)
     assert (now - created_at_29m) >= trailing_cfg.scalper_offer_max_seconds_major
 
+
+@pytest.mark.asyncio
+async def test_delta_client_update_bracket_stop_loss_live_edits_resting_stop_order():
+    """Verify in live trading mode that update_bracket_stop_loss finds resting stop-loss and updates via PUT /v2/orders."""
+    client = DeltaExchangeClient(api_key="dummy_key", api_secret="dummy_secret", live_trading=True)
+
+    # Mock get_open_orders to return a resting stop-loss order
+    client.get_open_orders = AsyncMock(return_value=[
+        {
+            "id": 999888,
+            "product_id": 27,
+            "order_type": "market_order",
+            "stop_order_type": "stop_loss_order",
+            "stop_price": "80000.0",
+            "state": "open",
+        }
+    ])
+    client._request = AsyncMock(return_value={"success": True, "id": 999888})
+
+    res = await client.update_bracket_stop_loss(
+        product_id=27,
+        new_sl=80500.0,
+        tick_size=0.5,
+        order_id="123456",
+        side="buy",
+        size=10,
+    )
+    assert res["success"] is True
+    assert res["bracket_stop_loss_price"] == 80500.0
+    client._request.assert_called_once_with(
+        "PUT",
+        "/v2/orders",
+        body={"id": 999888, "product_id": 27, "stop_price": "80500.0"},
+        weight=5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delta_client_update_bracket_stop_loss_fallback_places_new_order():
+    """Verify in live trading mode that if resting order not found and bracket PUT fails, a new stop order is posted."""
+    client = DeltaExchangeClient(api_key="dummy_key", api_secret="dummy_secret", live_trading=True)
+
+    # No open orders
+    client.get_open_orders = AsyncMock(return_value=[])
+
+    async def mock_request(method, path, body=None, weight=1, params=None):
+        if path == "/v2/orders/bracket":
+            raise Exception("open_order_not_found")
+        if path == "/v2/orders" and method == "POST":
+            return {"success": True, "id": 777666}
+        return {}
+
+    client._request = AsyncMock(side_effect=mock_request)
+
+    res = await client.update_bracket_stop_loss(
+        product_id=27,
+        new_sl=80500.0,
+        tick_size=0.5,
+        order_id="123456",
+        side="buy",
+        size=10,
+    )
+    assert res["success"] is True
+    assert res["bracket_stop_loss_price"] == 80500.0
+    # Verify POST was called for new stop order
+    post_calls = [c for c in client._request.call_args_list if c[0][0] == "POST" and c[0][1] == "/v2/orders"]
+    assert len(post_calls) == 1
+    call_body = post_calls[0][1]["body"]
+    assert call_body["stop_order_type"] == "stop_loss_order"
+    assert call_body["side"] == "sell"
+    assert call_body["stop_price"] == "80500.0"
+
+
+@pytest.mark.asyncio
+async def test_live_trailing_stop_loss_failsafe_execution():
+    """Verify that when live price crosses trailed sl_price, order_manager closes position and records TRAILING_SL_HIT."""
+    config = load_config()
+    client = DeltaExchangeClient(api_key="dummy_key", api_secret="dummy_secret", live_trading=True)
+    client.close_position = AsyncMock(return_value={"success": True})
+    rm = RiskManager(config.risk)
+    account_mgr = AccountManager(is_paper=False)
+    om = OrderManager(client, rm, config, account_mgr)
+
+    # Active BUY order entered at 80000.0, trailed SL is 80100.0 (+1% margin profit)
+    ao = ActiveOrder(
+        order_id="live_ord_1",
+        client_order_id="cli_1",
+        state=OrderState.FILLED,
+        symbol="BTCUSD",
+        side="BUY",
+        size=10.0,
+        entry_price=80000.0,
+        sl_price=80100.0,
+        tp_price=82000.0,
+        product_id=27,
+    )
+    om.active_orders["live_ord_1"] = ao
+
+    live_price = 80090.0 # Price pulled back below trailed SL (80100.0)
+    assert live_price <= ao.sl_price
+    reason = "TRAILING_SL_HIT" if ao.sl_price > ao.entry_price else "SL_HIT"
+    assert reason == "TRAILING_SL_HIT"
+
+    pnl = await om.close_and_record(reason=reason, close_price=live_price, contract_value=0.001)
+    # Expected profit: (80090 - 80000) * 10 * 0.001 = 0.90 USD
+    assert pytest.approx(pnl, rel=0.01) == 0.90
+    assert om.active_order is None
+    assert om.last_closed_order is not None
+    assert om.last_closed_order["reason"] == "TRAILING_SL_HIT"
+    assert om.last_closed_order["pnl"] == pnl
+    client.close_position.assert_called_once_with(27, "BUY", 10.0)
+
+

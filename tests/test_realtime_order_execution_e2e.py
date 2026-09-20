@@ -65,8 +65,8 @@ async def test_end_to_end_order_placement_margin_sl_tp():
     assert active.side == "LONG"
     assert active.entry_price == 80000.0
 
-    # Leverage must be set to 150x
-    delta_client.set_leverage.assert_called_once_with(1, 150)
+    # Leverage must be set to configured high leverage (25x)
+    delta_client.set_leverage.assert_called_once_with(1, config.risk.leverage.high_leverage_value)
 
     # Stop loss must be below entry for LONG and take profit above entry
     assert active.sl_price < 80000.0

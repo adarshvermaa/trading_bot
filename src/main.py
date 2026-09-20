@@ -273,40 +273,63 @@ class ScalpingBot:
                     )
                     if updated:
                         self.order_manager.update_active_sl(new_sl)
-                        await self.delta_client.update_bracket_stop_loss(product_id, new_sl, tick_size, order_id=active.order_id)
+                        await self.delta_client.update_bracket_stop_loss(
+                            product_id,
+                            new_sl,
+                            tick_size,
+                            order_id=active.order_id,
+                            side=active.side,
+                            size=active.size,
+                        )
                         logger.info(f"[TRAILING SL] {symbol}: {msg}")
 
-                # --- 2. Check paper SL/TP triggers ---
+                # --- 2. Check SL/TP triggers (Dual-Layer: Live Exchange Execution + Bot Failsafe) ---
+                trigger_reason: Optional[str] = None
                 if not self.delta_client.live_trading and product_id:
-                    sl_tp_result = self.delta_client.check_paper_sl_tp(product_id, live_price)
-                    if sl_tp_result:
-                        reason = sl_tp_result  # "SL_HIT" or "TP_HIT"
-                        logger.info(f"Paper {reason} for {symbol} at {live_price:.2f}")
+                    trigger_reason = self.delta_client.check_paper_sl_tp(product_id, live_price)
+                elif product_id and active.entry_price > 0:
+                    # Live trading failsafe: monitor live tick against active SL & TP
+                    is_long = active.side.lower() in ("buy", "long")
+                    # Check SL
+                    if active.sl_price and active.sl_price > 0:
+                        if is_long and live_price <= active.sl_price:
+                            trigger_reason = "TRAILING_SL_HIT" if active.sl_price > active.entry_price else "SL_HIT"
+                        elif not is_long and live_price >= active.sl_price:
+                            trigger_reason = "TRAILING_SL_HIT" if active.sl_price < active.entry_price else "SL_HIT"
 
-                        # Get contract_value for P&L calculation
-                        product = await self.delta_client.get_product(symbol)
-                        cv = float(product.get("contract_value", 1.0)) if product else 1.0
+                    # Check TP
+                    if not trigger_reason and active.tp_price and active.tp_price > 0:
+                        if is_long and live_price >= active.tp_price:
+                            trigger_reason = "TP_HIT"
+                        elif not is_long and live_price <= active.tp_price:
+                            trigger_reason = "TP_HIT"
 
-                        pnl = await self.order_manager.close_and_record(
-                            reason=reason,
-                            close_price=live_price,
-                            contract_value=cv,
-                        )
-                        self.order_manager.clear_closed_orders()
+                if trigger_reason:
+                    reason = trigger_reason
+                    logger.info(f"Position trigger {reason} for {symbol} at {live_price:.2f} (SL={active.sl_price}, TP={active.tp_price})")
 
-                        self._last_close_reason = reason
-                        self._position_health = "--"
+                    # Get contract_value for P&L calculation
+                    product = await self.delta_client.get_product(symbol)
+                    cv = float(product.get("contract_value", 1.0)) if product else 1.0
 
-                        # Set re-entry cooldown (5s for TP, 30s for SL)
-                        cooldown = 5.0 if reason == "TP_HIT" else float(self.config.risk.daily_limits.cooldown_seconds)
-                        if pnl >= 0:
-                            cooldown = 5.0  # Quick re-entry on profit
-                        self._re_entry_cooldown_until = time.time() + cooldown
+                    pnl = await self.order_manager.close_and_record(
+                        reason=reason,
+                        close_price=live_price,
+                        contract_value=cv,
+                    )
+                    self.order_manager.clear_closed_orders()
 
-                        logger.info(
-                            f"Position {reason}: pnl={pnl:.2f}, re-entry cooldown={cooldown}s"
-                        )
-                        continue
+                    self._last_close_reason = reason
+                    self._position_health = "--"
+
+                    # Set re-entry cooldown (5s for TP or profit exit, standard for SL)
+                    cooldown = 5.0 if (reason == "TP_HIT" or pnl >= 0) else float(self.config.risk.daily_limits.cooldown_seconds)
+                    self._re_entry_cooldown_until = time.time() + cooldown
+
+                    logger.info(
+                        f"Position {reason}: pnl={pnl:.2f}, re-entry cooldown={cooldown}s"
+                    )
+                    continue
 
                 # --- 3. Evaluate position health (every 5 seconds) ---
                 if int(time.time()) % 5 == 0:
