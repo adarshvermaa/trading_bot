@@ -75,7 +75,7 @@ class AccountManager:
                 notional = size_abs * cv * entry_p
                 
                 existing = self.positions.get(symbol)
-                lev = existing.leverage if (existing and existing.leverage > 1) else int(float(p.get('leverage', 150) or 150))
+                lev = existing.leverage if (existing and existing.leverage > 1) else int(float(p.get('leverage', 100) or 100))
                 sl_val = existing.sl if (existing and existing.sl > 0) else float(p.get('sl', 0.0))
                 tp_val = existing.tp if (existing and existing.tp > 0) else float(p.get('tp', 0.0))
                 entry_t = existing.entry_time if existing else float(p.get('entry_time', time.time()))

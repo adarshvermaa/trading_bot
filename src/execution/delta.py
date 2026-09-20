@@ -518,6 +518,33 @@ class DeltaExchangeClient:
             logger.debug(f"Failed to fetch best bid/ask for {symbol}: {e}")
             return None, None
 
+    async def get_orderbook_imbalance(self, symbol: str, depth: int = 5) -> float:
+        """Calculate Orderbook Imbalance (OBI) from top N levels of bids and asks.
+        
+        Formula: OBI = (bid_vol - ask_vol) / (bid_vol + ask_vol)
+        Range: [-1.0, +1.0]
+        - OBI > +0.20: Strong buyer dominance / support.
+        - OBI < -0.20: Strong seller dominance / resistance.
+        """
+        try:
+            ob = await self.get_orderbook(symbol, depth=depth)
+            if not ob:
+                return 0.0
+            bids = ob.get("buy", [])
+            asks = ob.get("sell", [])
+            
+            bid_vol = sum(float(b.get("size", 0.0)) for b in bids[:depth])
+            ask_vol = sum(float(a.get("size", 0.0)) for a in asks[:depth])
+            
+            total_vol = bid_vol + ask_vol
+            if total_vol <= 0:
+                return 0.0
+            
+            return (bid_vol - ask_vol) / total_vol
+        except Exception as e:
+            logger.debug(f"Failed to calculate orderbook imbalance for {symbol}: {e}")
+            return 0.0
+
 
     async def cancel_order(self, order_id: str, product_id: int) -> Dict[str, Any]:
         if not self.live_trading:

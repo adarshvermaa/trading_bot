@@ -15,6 +15,7 @@ async def test_end_to_end_order_placement_margin_sl_tp():
     config = load_config()
     delta_client = DeltaExchangeClient(api_key="", api_secret="", live_trading=False)
     delta_client.set_leverage = AsyncMock(return_value={"leverage": 150})
+    delta_client.get_orderbook_imbalance = AsyncMock(return_value=0.0)
     risk_manager = RiskManager(config.risk)
     order_manager = OrderManager(delta_client, risk_manager, config=config.strategy)
 

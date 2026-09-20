@@ -26,6 +26,7 @@ structure:
   liquidity_sweep_wick_ratio: 0.6
   displacement_body_ratio: 0.7
   retest_tolerance_atr_mult: 0.5
+  fvg_min_atr_mult: 0.3
 
 ml:
   model_path: "models/scalper_model.onnx"
@@ -46,4 +47,11 @@ execution:
   unfilled_timeout_seconds: 10      # Auto-cancel unfilled orders after 10 seconds
   use_orderbook_pricing: true       # When limit is used, cross spread at Best Ask (Buy) / Best Bid (Sell)
   max_slippage_bps: 15.0            # Max allowable spread/slippage before aborting
+  obi_filter_enabled: true          # Filter entries using live Delta L2 orderbook imbalance
+  obi_threshold: 0.30               # Maximum opposing orderbook imbalance tolerance (0.30 = 65/35 imbalance)
+
+session:
+  kill_zones_enabled: true          # Active session & kill zone tracking
+  dead_zone_min_confidence: 0.75    # Heightened ML confidence during low-volume Asian chop
+  standard_min_confidence: 0.65     # Standard ML confidence for London & NY Kill Zones
 

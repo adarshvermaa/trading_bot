@@ -110,6 +110,7 @@ class OrderManager:
         atr: Optional[float] = None,
         spread_bps: float = 0.0,
         equity: Optional[float] = None,
+        structural_target_tp: Optional[float] = None,
         **kwargs: Any,
     ) -> Optional[Dict[str, Any]]:
         if not client_order_id:
@@ -142,6 +143,35 @@ class OrderManager:
         if await self.has_active_position(product_id):
             logger.warning(f"Already have active position for {symbol}. Rejecting.")
             return None
+
+        # Step 1b: Orderbook Imbalance (OBI) Filter
+        obi_enabled = True
+        obi_threshold = 0.30
+        if self.config:
+            exec_cfg = getattr(self.config, "execution", None)
+            if exec_cfg:
+                obi_enabled = getattr(exec_cfg, "obi_filter_enabled", True)
+                obi_threshold = getattr(exec_cfg, "obi_threshold", 0.30)
+
+        if obi_enabled and hasattr(self.delta_client, "get_orderbook_imbalance"):
+            try:
+                raw_obi = await self.delta_client.get_orderbook_imbalance(symbol)
+                if isinstance(raw_obi, (int, float)):
+                    obi = float(raw_obi)
+                    if side.upper() in ("BUY", "LONG") and obi < -obi_threshold:
+                        logger.warning(
+                            f"Order rejected by OBI filter for {symbol} LONG: "
+                            f"Orderbook imbalance {obi:.2f} < -{obi_threshold:.2f} (heavy ask resistance wall)"
+                        )
+                        return None
+                    elif side.upper() in ("SELL", "SHORT") and obi > obi_threshold:
+                        logger.warning(
+                            f"Order rejected by OBI filter for {symbol} SHORT: "
+                            f"Orderbook imbalance {obi:.2f} > +{obi_threshold:.2f} (heavy bid support wall)"
+                        )
+                        return None
+            except Exception as e:
+                logger.debug(f"OBI filter check skipped: {e}")
 
         # Step 2: Validate leverage
         max_leverage = float(product.get("max_leverage", 100.0))
@@ -182,9 +212,14 @@ class OrderManager:
                 leverage=int(leverage),
                 contract_value=contract_val,
             )
-            size = float(computed_size if computed_size > 0 else 1)
-            margin = computed_margin
-            notional = computed_notional
+            if computed_size > 0:
+                size = float(computed_size)
+                margin = computed_margin
+                notional = computed_notional
+            else:
+                size = 1.0
+                notional = size * contract_val * price
+                margin = notional / leverage
         else:
             size = float(max(1, int(round(size))))
             notional = size * contract_val * price
@@ -193,7 +228,7 @@ class OrderManager:
         # Step 5: Liquidation distance
         liquidation_distance = price / leverage
 
-        # Step 6: Calculate SL/TP with tick_size rounding
+        # Step 6: Calculate SL/TP with tick_size rounding and optional structural target
         calc_sl, calc_tp = self.risk_manager.calculate_sl_tp(
             side=side,
             entry_price=price,
@@ -203,6 +238,7 @@ class OrderManager:
             size=int(size) if size >= 1 else 1,
             atr=atr if atr is not None else 100.0,
             tick_size=tick_size,
+            structural_target=structural_target_tp,
         )
         final_sl = round_to_tick(sl_price if sl_price is not None else calc_sl, tick_size)
         final_tp = round_to_tick(tp_price if tp_price is not None else calc_tp, tick_size)
@@ -473,7 +509,7 @@ class OrderManager:
                 if self.account_manager:
                     product = await self.delta_client.get_product(target_order.symbol)
                     cv = float(product.get("contract_value", 1.0)) if product else 1.0
-                    max_lev = float(product.get("max_leverage", 150.0)) if product else 150.0
+                    max_lev = float(product.get("max_leverage", 100.0)) if product else 100.0
                     notional = target_order.size * cv * fill_price
                     margin = notional / max_lev
                     self.account_manager.update_paper_position(

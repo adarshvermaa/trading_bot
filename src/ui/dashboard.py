@@ -17,8 +17,9 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 class Dashboard:
-    def __init__(self, mode: str):
+    def __init__(self, mode: str, target_leverage: int = 100):
         self.mode = mode.upper()
+        self.target_leverage = target_leverage
         self.console = Console()
         self.account_data: Dict[str, Any] = {}
         self.position_data: Dict[str, Any] = {}
@@ -120,7 +121,7 @@ class Dashboard:
         table.add_row("ETH Trend/5M", Text(f": {eth_sub}", style=eth_bias_col))
 
         # Strategic status
-        table.add_row("Target Lev", ": 150x Isolated")
+        table.add_row("Target Lev", f": {self.target_leverage}x Isolated")
         table.add_row("Margin Target", ": -3.0% SL | Trailing (+2%->+1% ... +200%)")
         table.add_row("Delta Offer", ": 29m Limit (Zero Closing Fee)")
 
@@ -156,7 +157,7 @@ class Dashboard:
         table.add_row("Current", f": ${cur_val:,.2f}" if cur_val > 0 else f": {cur}")
         
         lev = self.position_data.get('leverage')
-        lev_val = int(lev) if (isinstance(lev, (int, float)) and lev > 1) else 150
+        lev_val = int(lev) if (isinstance(lev, (int, float)) and lev > 1) else self.target_leverage
         table.add_row("Leverage", f": {lev_val}x")
         
         margin = self.position_data.get('margin', '--')
@@ -371,7 +372,7 @@ class Dashboard:
         
         mode_color = "green" if self.mode == "PAPER" else "red"
         now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        header_text = Text(f"[{self.mode}] TRADING BOT - DELTA INDIA  |  UTC: {now_utc}  |  STATUS: RUNNING (150x SCALP)", style=f"bold {mode_color}", justify="center")
+        header_text = Text(f"[{self.mode}] TRADING BOT - DELTA INDIA  |  UTC: {now_utc}  |  STATUS: RUNNING ({self.target_leverage}x SCALP)", style=f"bold {mode_color}", justify="center")
         layout["header"].update(Panel(header_text))
         
         layout["signal"].update(self._build_signal_panel())

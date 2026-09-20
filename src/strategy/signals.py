@@ -19,6 +19,7 @@ class Signal:
     timeframe_alignment: bool
     setup_type: str = "NONE"
     pattern: str = "NONE"
+    structural_target_tp: float = 0.0
 
 class SignalGenerator:
     def __init__(self, config: Any = None):
@@ -251,8 +252,32 @@ class SignalGenerator:
         strength = 0.0
         setup_type = getattr(structure, "setup_type", "NONE")
 
-        # --- Dual High-Accuracy Scalp Setups ---
-        if setup_type == "SWEEP_REVERSAL":
+        # --- High-Accuracy ICT Scalp Setups ---
+        if setup_type == "SWEEP_AND_FVG":
+            fvg_d = getattr(structure, "fvg_direction", "NONE")
+            if fvg_d == "BULLISH":
+                direction = "LONG"
+                strength = 0.92
+                if pattern in ("HAMMER", "BULLISH_ENGULFING"):
+                    strength = min(0.98, strength + 0.06)
+            elif fvg_d == "BEARISH":
+                direction = "SHORT"
+                strength = 0.92
+                if pattern in ("SHOOTING_STAR", "BEARISH_ENGULFING"):
+                    strength = min(0.98, strength + 0.06)
+        elif setup_type == "FVG_RETEST":
+            fvg_d = getattr(structure, "fvg_direction", "NONE")
+            if fvg_d == "BULLISH":
+                direction = "LONG"
+                strength = 0.88
+                if pattern in ("HAMMER", "BULLISH_ENGULFING"):
+                    strength = min(0.95, strength + 0.05)
+            elif fvg_d == "BEARISH":
+                direction = "SHORT"
+                strength = 0.88
+                if pattern in ("SHOOTING_STAR", "BEARISH_ENGULFING"):
+                    strength = min(0.95, strength + 0.05)
+        elif setup_type == "SWEEP_REVERSAL":
             sweep_dir = getattr(structure, "sweep_direction", "NONE")
             if sweep_dir == "BULLISH":
                 direction = "LONG"
@@ -297,12 +322,19 @@ class SignalGenerator:
             (structure.bias_15m == ema_cross)
             or (direction == "LONG" and ema_cross == "BULLISH")
             or (direction == "SHORT" and ema_cross == "BEARISH")
-            or (setup_type == "SWEEP_REVERSAL" and direction in ("LONG", "SHORT"))
+            or (setup_type in ("SWEEP_REVERSAL", "SWEEP_AND_FVG", "FVG_RETEST") and direction in ("LONG", "SHORT"))
         )
+
+        # Structural liquidity Take Profit targets
+        structural_target_tp = 0.0
+        if direction == "LONG" and structure.nearest_resistance > last_close:
+            structural_target_tp = float(structure.nearest_resistance)
+        elif direction == "SHORT" and structure.nearest_support > 0.0 and structure.nearest_support < last_close:
+            structural_target_tp = float(structure.nearest_support)
 
         return Signal(
             direction=direction,
-            strength=strength if (structure.is_valid or setup_type == "SWEEP_REVERSAL") else 0.0,
+            strength=strength if (structure.is_valid or setup_type in ("SWEEP_REVERSAL", "SWEEP_AND_FVG", "FVG_RETEST")) else 0.0,
             entry_price=last_close,
             sl_price=last_close * 0.99 if direction == 'LONG' else last_close * 1.01,
             tp_price=last_close * 1.02 if direction == 'LONG' else last_close * 0.98,
@@ -315,6 +347,7 @@ class SignalGenerator:
             timeframe_alignment=timeframe_alignment,
             setup_type=setup_type,
             pattern=pattern,
+            structural_target_tp=structural_target_tp,
         )
 
 

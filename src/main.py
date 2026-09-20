@@ -24,7 +24,7 @@ from src.execution.delta import DeltaExchangeClient
 from src.execution.order_manager import OrderManager, OrderState
 from src.strategy.structure import MarketStructure
 from src.strategy.signals import SignalGenerator
-from src.strategy.regime import RegimeFilter
+from src.strategy.regime import RegimeFilter, evaluate_session, SessionKillZone
 from src.ml.onnx_model import ONNXScalperModel
 from src.llm.advisor import LLMAdvisor
 from src.risk.risk_manager import RiskManager
@@ -100,7 +100,9 @@ class ScalpingBot:
         )
 
         # ---- UI layer ----
-        self.dashboard = Dashboard(mode=mode)
+        target_lev = getattr(getattr(self.config, "risk", None), "leverage", None)
+        high_lev = getattr(target_lev, "high_leverage_value", 100) if target_lev else 100
+        self.dashboard = Dashboard(mode=mode, target_leverage=high_lev)
 
         # ---- State ----
         self._last_scan_time: float = 0.0
@@ -439,6 +441,13 @@ class ScalpingBot:
 
             regime = self.regime_filter.evaluate(current_adx, current_atr, avg_atr)
 
+            # Session evaluation & adaptive confidence
+            session_cfg = getattr(self.config.strategy, "session", None)
+            std_conf = getattr(session_cfg, "standard_min_confidence", 0.65) if session_cfg else 0.65
+            dead_conf = getattr(session_cfg, "dead_zone_min_confidence", 0.75) if session_cfg else 0.75
+            session_info = evaluate_session(standard_confidence=std_conf, dead_zone_confidence=dead_conf)
+            effective_min_conf = session_info.recommended_min_confidence if getattr(session_cfg, "kill_zones_enabled", True) else self.config.strategy.ml.min_confidence
+
             # ML confirmation
             ml_confirmed = True
             ml_confidence = 0.0
@@ -458,7 +467,7 @@ class ScalpingBot:
                 )
                 eval_dir = sig.direction if sig.direction != "NONE" else ("LONG" if structure.bias_15m == "BULLISH" else "SHORT")
                 ml_confirmed, ml_confidence = self.onnx_model.confirm_signal(
-                    eval_dir, features, self.config.strategy.ml.min_confidence
+                    eval_dir, features, effective_min_conf
                 )
 
             # Composite score
@@ -471,13 +480,15 @@ class ScalpingBot:
                 + weights.ml_confidence * ml_confidence
             )
 
-            is_actionable = structure.is_valid and sig.direction in ("LONG", "SHORT") and (ml_confirmed or score >= 0.55)
+            score_hurdle = 0.70 if session_info.is_dead_zone else 0.55
+            is_actionable = structure.is_valid and sig.direction in ("LONG", "SHORT") and (ml_confirmed or score >= score_hurdle)
 
             evaluations.append({
                 "symbol": symbol,
                 "signal": sig,
                 "structure": structure,
                 "regime": regime,
+                "session": session_info,
                 "ml_confidence": ml_confidence,
                 "ml_confirmed": ml_confirmed,
                 "score": score,
@@ -552,6 +563,8 @@ class ScalpingBot:
             "next_trigger": next_trigger,
             "setup_type": getattr(top["structure"], "setup_type", "NONE"),
             "pattern": getattr(top["signal"], "pattern", "NONE"),
+            "session": getattr(getattr(top.get("session"), "zone", None), "value", "NORMAL"),
+            "fvg": f"{top['structure'].fvg_direction} (testing={top['structure'].fvg_testing})" if getattr(top['structure'], "fvg_detected", False) else "--",
         }
 
         # Return best setup if actionable
@@ -746,6 +759,7 @@ class ScalpingBot:
                                 spread_bps=0.0,
                                 equity=self.account_manager.equity,
                                 order_type=chosen_order_type,
+                                structural_target_tp=getattr(setup["signal"], "structural_target_tp", None),
                             )
 
                             self._position_health = "STRONG"

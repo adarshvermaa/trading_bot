@@ -59,6 +59,7 @@ class StructureConfig(BaseModel):
     liquidity_sweep_wick_ratio: float = 0.6
     displacement_body_ratio: float = 0.7
     retest_tolerance_atr_mult: float = 0.5
+    fvg_min_atr_mult: float = 0.3
 
 
 class MLConfig(BaseModel):
@@ -85,6 +86,14 @@ class ExecutionConfig(BaseModel):
     unfilled_timeout_seconds: float = 10.0
     use_orderbook_pricing: bool = True
     max_slippage_bps: float = 15.0
+    obi_filter_enabled: bool = True
+    obi_threshold: float = 0.30
+
+
+class SessionConfig(BaseModel):
+    kill_zones_enabled: bool = True
+    dead_zone_min_confidence: float = 0.75
+    standard_min_confidence: float = 0.65
 
 
 class AssetConfig(BaseModel):
@@ -99,6 +108,7 @@ class StrategyConfig(BaseModel):
     ml: MLConfig = Field(default_factory=MLConfig)
     scanner: ScannerConfig = Field(default_factory=ScannerConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    session: SessionConfig = Field(default_factory=SessionConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -113,15 +123,15 @@ class CapitalConfig(BaseModel):
 
 class LeverageConfig(BaseModel):
     high_leverage_assets: list[str] = Field(default_factory=lambda: ["BTCUSD", "ETHUSD"])
-    high_leverage_value: int = 25
-    default_leverage_value: int = 20
-    safe_fallback_leverage: int = 10
+    high_leverage_value: int = 100
+    default_leverage_value: int = 50
+    safe_fallback_leverage: int = 25
     reject_on_leverage_fail: bool = False
 
 
 class StopLossConfig(BaseModel):
     max_loss_pct_of_margin: float = 0.03
-    min_stop_distance_atr: float = 0.1
+    min_stop_distance_atr: float = 0.05
 
 
 class TakeProfitConfig(BaseModel):

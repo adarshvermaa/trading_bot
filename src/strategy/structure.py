@@ -23,6 +23,11 @@ class StructureAnalysis:
     setup_type: str = "NONE"
     sweep_direction: str = "NONE"
     at_key_level: bool = False
+    fvg_detected: bool = False
+    fvg_direction: str = "NONE"
+    fvg_top: float = 0.0
+    fvg_bottom: float = 0.0
+    fvg_testing: bool = False
 
     def __post_init__(self):
         if self.support_levels is None:
@@ -37,18 +42,21 @@ class MarketStructure:
         lookback: int = 10, 
         wick_ratio_threshold: float = 0.6, 
         displacement_threshold: float = 0.7, 
-        retest_tolerance_mult: float = 0.5
+        retest_tolerance_mult: float = 0.5,
+        fvg_min_atr_mult: float = 0.3,
     ):
         if config is not None and not isinstance(config, int):
             self.lookback = getattr(config, "min_swing_lookback", getattr(config, "lookback", 10))
             self.wick_ratio_threshold = getattr(config, "liquidity_sweep_wick_ratio", getattr(config, "wick_ratio_threshold", 0.6))
             self.displacement_threshold = getattr(config, "displacement_body_ratio", getattr(config, "displacement_threshold", 0.7))
             self.retest_tolerance_mult = getattr(config, "retest_tolerance_atr_mult", getattr(config, "retest_tolerance_mult", 0.5))
+            self.fvg_min_atr_mult = getattr(config, "fvg_min_atr_mult", fvg_min_atr_mult)
         else:
             self.lookback = config if isinstance(config, int) else lookback
             self.wick_ratio_threshold = wick_ratio_threshold
             self.displacement_threshold = displacement_threshold
             self.retest_tolerance_mult = retest_tolerance_mult
+            self.fvg_min_atr_mult = fvg_min_atr_mult
 
     def _extract_arrays(self, candles: Any) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if not candles:
@@ -111,6 +119,59 @@ class MarketStructure:
         nearest_resistance = resistance_levels[0] if resistance_levels else 0.0
         
         return support_levels, resistance_levels, nearest_support, nearest_resistance
+
+    def detect_fair_value_gaps(
+        self, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, atr: float = 0.0
+    ) -> Tuple[bool, str, float, float, bool]:
+        """Detect 3-candle Fair Value Gap (FVG) and determine if current price is testing/mitigating it.
+        
+        Definition:
+        - Bullish FVG: Low[i] > High[i-2] (gap between candle 1 high and candle 3 low).
+        - Bearish FVG: High[i] < Low[i-2] (gap between candle 1 low and candle 3 high).
+        
+        Returns: (fvg_detected, fvg_direction, fvg_top, fvg_bottom, is_testing)
+        """
+        n = len(highs)
+        if n < 3:
+            return False, "NONE", 0.0, 0.0, False
+
+        min_gap = (atr * self.fvg_min_atr_mult) if atr > 0 else 0.0
+        cur_price = closes[-1] if len(closes) > 0 else 0.0
+
+        scan_limit = min(15, n - 2)
+        for offset in range(1, scan_limit + 1):
+            i = n - offset
+            if i < 2:
+                break
+
+            c1_high = highs[i - 2]
+            c1_low = lows[i - 2]
+            c3_high = highs[i]
+            c3_low = lows[i]
+
+            # Bullish FVG: c3_low > c1_high
+            if c3_low > c1_high:
+                gap = c3_low - c1_high
+                if gap >= min_gap:
+                    fvg_top = float(c3_low)
+                    fvg_bottom = float(c1_high)
+                    subsequent_lows = lows[i:]
+                    is_testing = any(fvg_bottom <= l_val <= fvg_top or fvg_bottom <= cur_price <= fvg_top for l_val in subsequent_lows)
+                    if cur_price >= fvg_bottom:
+                        return True, "BULLISH", fvg_top, fvg_bottom, is_testing
+
+            # Bearish FVG: c3_high < c1_low
+            elif c3_high < c1_low:
+                gap = c1_low - c3_high
+                if gap >= min_gap:
+                    fvg_top = float(c1_low)
+                    fvg_bottom = float(c3_high)
+                    subsequent_highs = highs[i:]
+                    is_testing = any(fvg_bottom <= h_val <= fvg_top or fvg_bottom <= cur_price <= fvg_top for h_val in subsequent_highs)
+                    if cur_price <= fvg_top:
+                        return True, "BEARISH", fvg_top, fvg_bottom, is_testing
+
+        return False, "NONE", 0.0, 0.0, False
 
     def analyze(self, candles_15m: List[Any], candles_5m: List[Any], candles_1m: List[Any], atr_1m: float) -> StructureAnalysis:
         logger.info("Analyzing market structure across timeframes")
@@ -301,11 +362,39 @@ class MarketStructure:
             elif sl_5 and lo_5[-1] < lo_5[sl_5[-1]]:
                 sweep_direction = 'BULLISH'
 
-        # Determine Setup Type
+        # Fair Value Gap detection (check 1m first, fallback to 5m)
+        fvg_detected = False
+        fvg_dir = "NONE"
+        fvg_top = 0.0
+        fvg_bottom = 0.0
+        fvg_testing = False
+
+        if len(hi_1) >= 3:
+            fvg_detected, fvg_dir, fvg_top, fvg_bottom, fvg_testing = self.detect_fair_value_gaps(
+                hi_1, lo_1, cl_1, atr=atr_1m
+            )
+        if not fvg_detected and len(hi_5) >= 3:
+            fvg_detected, fvg_dir, fvg_top, fvg_bottom, fvg_testing = self.detect_fair_value_gaps(
+                hi_5, lo_5, cl_5, atr=atr_1m * 2.0
+            )
+
+        # Determine Setup Type with high-probability ICT confluence
         setup_type = "NONE"
-        if liquidity_sweep_5m and sweep_direction in ('BULLISH', 'BEARISH'):
+        if liquidity_sweep_5m and fvg_detected and sweep_direction == fvg_dir:
+            # Swept liquidity, displaced into an FVG, and returning: Ultimate ICT Setup
+            setup_type = "SWEEP_AND_FVG"
+            is_valid = True
+            invalidation_reason = None
+        elif liquidity_sweep_5m and sweep_direction in ('BULLISH', 'BEARISH'):
             setup_type = "SWEEP_REVERSAL"
             # A sweep of support/resistance is an intentional reversal scalp; mark valid
+            is_valid = True
+            invalidation_reason = None
+        elif fvg_detected and fvg_testing and (
+            (fvg_dir == "BULLISH" and bias_15m == "BULLISH") or
+            (fvg_dir == "BEARISH" and bias_15m == "BEARISH")
+        ):
+            setup_type = "FVG_RETEST"
             is_valid = True
             invalidation_reason = None
         elif is_valid and (retest_1m or displacement_1m):
@@ -330,4 +419,9 @@ class MarketStructure:
             setup_type=setup_type,
             sweep_direction=sweep_direction,
             at_key_level=at_key_level,
+            fvg_detected=fvg_detected,
+            fvg_direction=fvg_dir,
+            fvg_top=fvg_top,
+            fvg_bottom=fvg_bottom,
+            fvg_testing=fvg_testing,
         )

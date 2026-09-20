@@ -345,6 +345,7 @@ async def test_validate_and_place_order_paper_market_flow(test_setup):
     delta_client.set_leverage = AsyncMock(return_value={"success": True})
     delta_client._latest_prices["ETHUSD"] = 2648.75
     delta_client.get_best_bid_ask = AsyncMock(return_value=(None, None))
+    delta_client.get_orderbook_imbalance = AsyncMock(return_value=0.0)
 
     res = await order_manager.validate_and_place_order(
         symbol="ETHUSD",

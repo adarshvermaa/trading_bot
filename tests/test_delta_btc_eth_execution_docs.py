@@ -143,6 +143,7 @@ async def test_signal_to_delta_order_manager_execution():
         "live_trading": False,
         "paper_balance": 10000.0
     })
+    delta_client.get_orderbook_imbalance = AsyncMock(return_value=0.0)
     risk_manager = RiskManager(config.risk)
     account_manager = AccountManager(is_paper=True, paper_balance=10000.0)
     order_manager = OrderManager(

@@ -7,14 +7,14 @@ leverage:
   high_leverage_assets:
     - BTCUSD
     - ETHUSD
-  high_leverage_value: 25
-  default_leverage_value: 20
-  safe_fallback_leverage: 10
+  high_leverage_value: 100
+  default_leverage_value: 50
+  safe_fallback_leverage: 25
   reject_on_leverage_fail: false
 
 stop_loss:
   max_loss_pct_of_margin: 0.03
-  min_stop_distance_atr: 0.1
+  min_stop_distance_atr: 0.05
 
 take_profit:
   target_pct_of_margin: 2.00

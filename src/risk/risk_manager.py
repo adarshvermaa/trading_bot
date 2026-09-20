@@ -124,7 +124,25 @@ class RiskManager:
 
     def calculate_take_profit(self, entry_price: float, side: str, margin: float, leverage: int, 
                               contract_value: float, size: int, 
-                              tick_size: Optional[float] = None) -> float:
+                              tick_size: Optional[float] = None,
+                              structural_target: Optional[float] = None,
+                              sl_price: Optional[float] = None) -> float:
+        is_long = side.upper() in ('LONG', 'BUY')
+        
+        # Check if structural target provides a sound Risk:Reward ratio (>= 1.5R)
+        if structural_target and structural_target > 0:
+            if is_long and structural_target > entry_price:
+                reward = structural_target - entry_price
+                risk = (entry_price - sl_price) if (sl_price and sl_price < entry_price) else (entry_price * 0.03 / max(1, leverage))
+                if risk > 0 and (reward / risk) >= 1.5:
+                    tp = round_to_tick(structural_target, tick_size, direction='DOWN') if (tick_size and tick_size > 0) else structural_target
+                    return tp
+            elif not is_long and structural_target < entry_price:
+                reward = entry_price - structural_target
+                risk = (sl_price - entry_price) if (sl_price and sl_price > entry_price) else (entry_price * 0.03 / max(1, leverage))
+                if risk > 0 and (reward / risk) >= 1.5:
+                    tp = round_to_tick(structural_target, tick_size, direction='UP') if (tick_size and tick_size > 0) else structural_target
+                    return tp
         
         target_pct = self.config.take_profit.target_pct_of_margin
         profit_amount = margin * target_pct
@@ -135,7 +153,7 @@ class RiskManager:
         else:
             price_diff = entry_price * (target_pct / max(1, leverage))
         
-        if side.upper() in ('LONG', 'BUY'):
+        if is_long:
             tp_price = entry_price + price_diff
             if tick_size and tick_size > 0:
                 tp_price = round_to_tick(tp_price, tick_size, direction='UP')
@@ -233,9 +251,13 @@ class RiskManager:
 
     def calculate_sl_tp(self, side: str, entry_price: float, margin: float = 1000.0, leverage: int = 10, 
                         contract_value: float = 1.0, size: int = 1, atr: float = 100.0,
-                        tick_size: Optional[float] = None) -> Tuple[float, float]:
+                        tick_size: Optional[float] = None,
+                        structural_target: Optional[float] = None) -> Tuple[float, float]:
         sl_price, _, _ = self.calculate_stop_loss(entry_price, side, margin, leverage, contract_value, size, atr, tick_size=tick_size)
-        tp_price = self.calculate_take_profit(entry_price, side, margin, leverage, contract_value, size, tick_size=tick_size)
+        tp_price = self.calculate_take_profit(
+            entry_price, side, margin, leverage, contract_value, size, 
+            tick_size=tick_size, structural_target=structural_target, sl_price=sl_price
+        )
         return sl_price, tp_price
 
     def validate_trade(self, equity: float, margin: float, notional: float, leverage: int = 1, sl_price: float = 1.0, 
@@ -254,7 +276,9 @@ class RiskManager:
         if has_position:
             return False, "MAX_POSITIONS_REACHED"
 
-        if margin > equity * self.config.capital.max_allocation_pct:
+        # Allow single minimum contract if margin <= equity even if it slightly exceeds allocation cap for micro balances
+        allow_micro_min_contract = (margin <= equity) and (equity <= 10.0 or kwargs.get("is_min_contract", False))
+        if margin > equity * self.config.capital.max_allocation_pct and not allow_micro_min_contract:
             return False, "INSUFFICIENT_EQUITY"
 
         if self.daily_start_equity > 0:
