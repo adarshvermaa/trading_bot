@@ -123,9 +123,9 @@ class CapitalConfig(BaseModel):
 
 class LeverageConfig(BaseModel):
     high_leverage_assets: list[str] = Field(default_factory=lambda: ["BTCUSD", "ETHUSD"])
-    high_leverage_value: int = 100
-    default_leverage_value: int = 50
-    safe_fallback_leverage: int = 25
+    high_leverage_value: int = 25
+    default_leverage_value: int = 20
+    safe_fallback_leverage: int = 10
     reject_on_leverage_fail: bool = False
 
 

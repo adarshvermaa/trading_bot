@@ -7,9 +7,9 @@ leverage:
   high_leverage_assets:
     - BTCUSD
     - ETHUSD
-  high_leverage_value: 100
-  default_leverage_value: 50
-  safe_fallback_leverage: 25
+  high_leverage_value: 25
+  default_leverage_value: 20
+  safe_fallback_leverage: 10
   reject_on_leverage_fail: false
 
 stop_loss:
