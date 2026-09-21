@@ -35,6 +35,7 @@ class ActiveOrder:
     initial_sl: Optional[float] = None
     setup_type: str = "NONE"
     execution_routing: str = "MARKET_MOMENTUM"
+    entry_fingerprint: Optional[Any] = None
 
     def __post_init__(self):
         if self.created_at == 0.0:
@@ -49,11 +50,13 @@ class OrderManager:
         risk_manager: RiskManager,
         config: Any,
         account_manager: Optional[Any] = None,
+        pattern_memory: Optional[Any] = None,
     ):
         self.delta_client = delta_client
         self.risk_manager = risk_manager
         self.config = config
         self.account_manager = account_manager
+        self.pattern_memory = pattern_memory
         self.active_orders: Dict[str, ActiveOrder] = {}
         self.active_client_ids: set[str] = set()
         self.last_closed_order: Optional[Dict[str, Any]] = None
@@ -117,6 +120,7 @@ class OrderManager:
         equity: Optional[float] = None,
         structural_target_tp: Optional[float] = None,
         setup_type: str = "NONE",
+        fingerprint: Optional[Any] = None,
         **kwargs: Any,
     ) -> Optional[Dict[str, Any]]:
         if not client_order_id:
@@ -334,6 +338,7 @@ class OrderManager:
                     initial_sl=final_sl,
                     setup_type=setup_type,
                     execution_routing=execution_routing,
+                    entry_fingerprint=fingerprint or kwargs.get("fingerprint"),
                 )
                 self.active_orders[order_id] = active_order
 
@@ -453,6 +458,18 @@ class OrderManager:
 
         # Record in risk manager
         self.risk_manager.record_trade_result(pnl)
+
+        # Record in pattern memory
+        if getattr(target, "entry_fingerprint", None) is not None and self.pattern_memory is not None:
+            try:
+                self.pattern_memory.record_trade_result(
+                    fingerprint=target.entry_fingerprint,
+                    pnl=pnl,
+                    close_reason=reason,
+                    trade_id=target.order_id,
+                )
+            except Exception as e:
+                logger.error(f"Failed to record trade result in pattern memory: {e}")
 
         # Update order state
         pnl_str = f"+${pnl:,.2f}" if pnl >= 0 else f"-${abs(pnl):,.2f}"

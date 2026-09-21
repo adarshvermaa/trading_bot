@@ -26,6 +26,7 @@ from src.strategy.structure import MarketStructure
 from src.strategy.signals import SignalGenerator
 from src.strategy.regime import RegimeFilter, evaluate_session, SessionKillZone
 from src.ml.onnx_model import ONNXScalperModel
+from src.ml.pattern_memory import PatternMemoryStore, MarketPatternFingerprint
 from src.llm.advisor import LLMAdvisor
 from src.risk.risk_manager import RiskManager
 from src.portfolio.account import AccountManager
@@ -76,6 +77,9 @@ class ScalpingBot:
         # ---- ML layer ----
         self.onnx_model = ONNXScalperModel(config.strategy.ml.model_path)
 
+        # ---- Pattern Memory Layer ----
+        self.pattern_memory = PatternMemoryStore()
+
         # ---- LLM layer ----
         self.llm_advisor = LLMAdvisor(
             api_key=config.env.litellm_api_key,
@@ -97,6 +101,7 @@ class ScalpingBot:
             risk_manager=self.risk_manager,
             config=config,
             account_manager=self.account_manager,
+            pattern_memory=self.pattern_memory,
         )
 
         # ---- UI layer ----
@@ -112,6 +117,7 @@ class ScalpingBot:
         self._nearest_support: float = 0.0
         self._nearest_resistance: float = 0.0
         self._last_close_reason: str = ""
+        self._last_pattern_audit: str = "NEUTRAL"
         self._re_entry_cooldown_until: float = 0.0
         self._asset_rankings: list[dict[str, Any]] = []
         self._market_watch: dict[str, Any] = {"assets": {}}
@@ -506,23 +512,80 @@ class ScalpingBot:
             session_info = evaluate_session(standard_confidence=std_conf, dead_zone_confidence=dead_conf)
             effective_min_conf = session_info.recommended_min_confidence if getattr(session_cfg, "kill_zones_enabled", True) else self.config.strategy.ml.min_confidence
 
+            # Build MarketPatternFingerprint (20 features)
+            cur_p = float(arr_1m["close"][-1])
+            cur_o = float(arr_1m["open"][-1])
+            cur_h = float(arr_1m["high"][-1])
+            cur_l = float(arr_1m["low"][-1])
+            cur_range = max(cur_h - cur_l, 1e-9)
+            u_wick = max(0.0, cur_h - max(cur_o, cur_p)) / cur_range
+            l_wick = max(0.0, min(cur_o, cur_p) - cur_l) / cur_range
+            b_ratio = abs(cur_p - cur_o) / cur_range
+
+            vah = getattr(structure, "vah", 0.0) or (htf_levels.get("VAH", 0.0) if htf_levels else 0.0)
+            val = getattr(structure, "val", 0.0) or (htf_levels.get("VAL", 0.0) if htf_levels else 0.0)
+            pdh = getattr(structure, "pdh", 0.0) or (htf_levels.get("PDH", 0.0) if htf_levels else 0.0)
+            pdl = getattr(structure, "pdl", 0.0) or (htf_levels.get("PDL", 0.0) if htf_levels else 0.0)
+
+            dist_vah = (cur_p - vah) / vah if vah > 0 else 0.0
+            dist_val = (cur_p - val) / val if val > 0 else 0.0
+            dist_pdh = (cur_p - pdh) / pdh if pdh > 0 else 0.0
+            dist_pdl = (cur_p - pdl) / pdl if pdl > 0 else 0.0
+
+            ema_trend_val = 1.0 if sig.ema_cross == "BULLISH" else (-1.0 if sig.ema_cross == "BEARISH" else 0.0)
+            vwap_values = compute_vwap(arr_1m["high"], arr_1m["low"], arr_1m["close"], arr_1m["volume"])
+            cur_vwap = float(vwap_values[-1]) if len(vwap_values) > 0 else cur_p
+            vwap_dist = (cur_p - cur_vwap) / cur_vwap if cur_vwap > 0 else 0.0
+
+            fingerprint = MarketPatternFingerprint(
+                rsi_norm=sig.rsi / 100.0,
+                adx_norm=current_adx / 100.0,
+                atr_norm=current_atr / cur_p if cur_p > 0 else 0.0,
+                vwap_dist=vwap_dist,
+                vol_ratio=sig.relative_volume,
+                ema_trend=ema_trend_val,
+                is_squeeze=1.0 if getattr(structure, "is_squeeze", False) else 0.0,
+                structure_score=sig.strength,
+                dist_to_vah_pct=dist_vah,
+                dist_to_val_pct=dist_val,
+                dist_to_pdh_pct=dist_pdh,
+                dist_to_pdl_pct=dist_pdl,
+                is_bull_trap=1.0 if getattr(structure, "is_bull_trap", False) else 0.0,
+                is_bear_trap=1.0 if getattr(structure, "is_bear_trap", False) else 0.0,
+                is_judas_swing=1.0 if getattr(structure, "is_judas_swing", False) else 0.0,
+                is_volume_absorption=1.0 if getattr(structure, "is_volume_absorption", False) else 0.0,
+                upper_wick_ratio=u_wick,
+                lower_wick_ratio=l_wick,
+                body_ratio=b_ratio,
+                spread_bps=0.8,
+                symbol=symbol,
+                direction=sig.direction if sig.direction != "NONE" else ("LONG" if structure.bias_15m == "BULLISH" else "SHORT"),
+                entry_price=cur_p,
+            )
+
+            # Pattern Memory Check (Sub-millisecond VETO or BOOST)
+            pattern_audit = self.pattern_memory.check_pattern(fingerprint)
+            if pattern_audit.is_blocked:
+                logger.warning(
+                    f"Pattern Memory VETO for {symbol} {sig.direction}: {pattern_audit.reason}"
+                )
+                self._last_pattern_audit = f"VETO ({pattern_audit.matched_loss_trade_id})"
+                continue
+
+            if pattern_audit.is_boosted:
+                logger.info(
+                    f"Pattern Memory BOOST for {symbol} {sig.direction}: {pattern_audit.reason}"
+                )
+                self._last_pattern_audit = f"BOOST (+{pattern_audit.confidence_adjustment:.2f})"
+                sig.strength = min(1.0, sig.strength + pattern_audit.confidence_adjustment)
+            else:
+                self._last_pattern_audit = "NEUTRAL"
+
             # ML confirmation
             ml_confirmed = True
             ml_confidence = 0.0
             if self.config.strategy.ml.enabled and self.onnx_model.is_available:
-                vwap_values = compute_vwap(arr_1m["high"], arr_1m["low"], arr_1m["close"], arr_1m["volume"])
-                cur_vwap = float(vwap_values[-1]) if len(vwap_values) > 0 else float(arr_1m["close"][-1])
-                vwap_dist = (float(arr_1m["close"][-1]) - cur_vwap) / cur_vwap if cur_vwap > 0 else 0.0
-
-                features = self.onnx_model.prepare_features(
-                    ema_cross_signal=sig.ema_cross,
-                    rsi=sig.rsi,
-                    atr_normalized=current_atr / float(arr_1m["close"][-1]) if arr_1m["close"][-1] > 0 else 0,
-                    vwap_distance=vwap_dist,
-                    volume_ratio=sig.relative_volume,
-                    adx=current_adx,
-                    structure_score=sig.strength,
-                )
+                features = self.onnx_model.prepare_pattern_features(fingerprint)
                 eval_dir = sig.direction if sig.direction != "NONE" else ("LONG" if structure.bias_15m == "BULLISH" else "SHORT")
                 ml_confirmed, ml_confidence = self.onnx_model.confirm_signal(
                     eval_dir, features, effective_min_conf
@@ -552,6 +615,7 @@ class ScalpingBot:
                 "score": score,
                 "atr": current_atr,
                 "is_actionable": is_actionable,
+                "fingerprint": fingerprint,
             })
 
         if not evaluations:
@@ -633,6 +697,8 @@ class ScalpingBot:
             "rsi": f"{top['signal'].rsi:.1f}",
             "volume": f"{top['signal'].relative_volume:.2f}x",
             "onnx_confidence": f"{top['ml_confidence']:.1%}" if top['ml_confidence'] > 0 else "--",
+            "pattern_memory_stats": f"W:{len(self.pattern_memory.winning_patterns)} | L:{len(self.pattern_memory.losing_patterns)}",
+            "last_pattern_audit": self._last_pattern_audit,
             "llm_status": self.llm_advisor.get_status(),
             "signal_score": f"ACTIONABLE ({top['score']:.3f})" if top["is_actionable"] else f"RANK #{1} {top['symbol']} ({top['score']:.2f})",
             "next_trigger": next_trigger,
@@ -838,6 +904,7 @@ class ScalpingBot:
                                 structural_target_tp=getattr(setup["signal"], "structural_target_tp", None),
                                 setup_type=getattr(setup["signal"], "setup_type", "NONE"),
                                 trap_wick_price=getattr(setup["signal"], "trap_wick_price", None),
+                                fingerprint=setup.get("fingerprint"),
                             )
 
                             self._position_health = "STRONG"

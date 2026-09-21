@@ -338,6 +338,8 @@ class Dashboard:
         table.add_row("VWAP / RSI", f": {self.signal_data.get('vwap', '--')} | RSI {self.signal_data.get('rsi', '--')}")
         table.add_row("Volume", f": {self.signal_data.get('volume', '--')}")
         table.add_row("ONNX Conf", f": {self.signal_data.get('onnx_confidence', '--')}")
+        table.add_row("Pattern Memory", Text(f": {self.signal_data.get('pattern_memory_stats', 'W: 0 | L: 0')}", style="bold green"))
+        table.add_row("Pattern Audit", Text(f": {self.signal_data.get('last_pattern_audit', 'Neutral')}", style="cyan"))
         table.add_row("LLM Status", f": {self.signal_data.get('llm_status', 'Disabled')}")
         table.add_row("Score", f": {self.signal_data.get('signal_score', '--')}")
 
