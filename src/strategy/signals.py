@@ -20,6 +20,7 @@ class Signal:
     setup_type: str = "NONE"
     pattern: str = "NONE"
     structural_target_tp: float = 0.0
+    trap_wick_price: float = 0.0
 
 class SignalGenerator:
     calculate_volatility_squeeze = staticmethod(calculate_volatility_squeeze)
@@ -280,7 +281,43 @@ class SignalGenerator:
                 strength = 0.90
                 if pattern in ("SHOOTING_STAR", "BEARISH_ENGULFING"):
                     strength = 0.95
-        # --- High-Accuracy ICT Scalp Setups ---
+        elif setup_type == "VALUE_AREA_BREAKOUT":
+            va_dir = getattr(structure, "breakout_direction", "NONE")
+            if va_dir == "BULLISH":
+                direction = "LONG"
+                strength = 0.95
+                if pattern in ("HAMMER", "BULLISH_ENGULFING"):
+                    strength = 0.98
+            elif va_dir == "BEARISH":
+                direction = "SHORT"
+                strength = 0.95
+                if pattern in ("SHOOTING_STAR", "BEARISH_ENGULFING"):
+                    strength = 0.98
+        # --- High-Accuracy ICT Scalp & Liquidity Setups ---
+        elif setup_type == "LIQUIDITY_HUNT_REVERSAL":
+            sweep_dir = getattr(structure, "sweep_direction", "NONE")
+            if sweep_dir == "BULLISH":
+                direction = "LONG"
+                strength = 0.94
+                if pattern in ("HAMMER", "BULLISH_ENGULFING"):
+                    strength = min(0.98, strength + 0.04)
+            elif sweep_dir == "BEARISH":
+                direction = "SHORT"
+                strength = 0.94
+                if pattern in ("SHOOTING_STAR", "BEARISH_ENGULFING"):
+                    strength = min(0.98, strength + 0.04)
+        elif setup_type == "ORDER_BLOCK_PULLBACK":
+            ob_dir = getattr(structure, "ob_direction", "NONE")
+            if ob_dir == "BULLISH":
+                direction = "LONG"
+                strength = 0.92
+                if pattern in ("HAMMER", "BULLISH_ENGULFING"):
+                    strength = min(0.98, strength + 0.05)
+            elif ob_dir == "BEARISH":
+                direction = "SHORT"
+                strength = 0.92
+                if pattern in ("SHOOTING_STAR", "BEARISH_ENGULFING"):
+                    strength = min(0.98, strength + 0.05)
         elif setup_type == "SWEEP_AND_FVG":
             fvg_d = getattr(structure, "fvg_direction", "NONE")
             if fvg_d == "BULLISH":
@@ -305,6 +342,23 @@ class SignalGenerator:
                 strength = 0.88
                 if pattern in ("SHOOTING_STAR", "BEARISH_ENGULFING"):
                     strength = min(0.95, strength + 0.05)
+        elif setup_type == "BULL_TRAP_REVERSAL":
+            direction = "SHORT"
+            strength = 0.90
+            if pattern in ("SHOOTING_STAR", "BEARISH_ENGULFING"):
+                strength = min(0.95, strength + 0.05)
+        elif setup_type == "BEAR_TRAP_REVERSAL":
+            direction = "LONG"
+            strength = 0.90
+            if pattern in ("HAMMER", "BULLISH_ENGULFING"):
+                strength = min(0.95, strength + 0.05)
+        elif setup_type in ("JUDAS_SWING_FADE", "VOLUME_ABSORPTION_REVERSAL"):
+            sweep_dir = getattr(structure, "sweep_direction", "NONE")
+            direction = "SHORT" if sweep_dir == "BEARISH" else "LONG"
+            strength = 0.88
+            if (direction == "SHORT" and pattern in ("SHOOTING_STAR", "BEARISH_ENGULFING")) or \
+               (direction == "LONG" and pattern in ("HAMMER", "BULLISH_ENGULFING")):
+                strength = min(0.95, strength + 0.05)
         elif setup_type == "SWEEP_REVERSAL":
             sweep_dir = getattr(structure, "sweep_direction", "NONE")
             if sweep_dir == "BULLISH":
@@ -350,25 +404,52 @@ class SignalGenerator:
             (structure.bias_15m == ema_cross)
             or (direction == "LONG" and ema_cross == "BULLISH")
             or (direction == "SHORT" and ema_cross == "BEARISH")
-            or (setup_type in ("SWEEP_REVERSAL", "SWEEP_AND_FVG", "FVG_RETEST", "HTF_BREAKOUT", "BREAKOUT_RETEST") and direction in ("LONG", "SHORT"))
+            or (setup_type in (
+                "SWEEP_REVERSAL", "SWEEP_AND_FVG", "FVG_RETEST", 
+                "HTF_BREAKOUT", "BREAKOUT_RETEST", "LIQUIDITY_HUNT_REVERSAL",
+                "ORDER_BLOCK_PULLBACK", "VALUE_AREA_BREAKOUT",
+                "BULL_TRAP_REVERSAL", "BEAR_TRAP_REVERSAL",
+                "JUDAS_SWING_FADE", "VOLUME_ABSORPTION_REVERSAL"
+            ) and direction in ("LONG", "SHORT"))
         )
 
         # Structural liquidity Take Profit targets
         structural_target_tp = 0.0
-        if setup_type in ("HTF_BREAKOUT", "BREAKOUT_RETEST"):
+        if setup_type in ("HTF_BREAKOUT", "BREAKOUT_RETEST", "VALUE_AREA_BREAKOUT"):
             if direction == "LONG":
                 structural_target_tp = max(last_close * 1.04, float(structure.nearest_resistance) if structure.nearest_resistance > last_close else 0.0)
             elif direction == "SHORT":
                 structural_target_tp = min(last_close * 0.96, float(structure.nearest_support) if structure.nearest_support > 0.0 else last_close * 0.96)
+        elif setup_type in ("BULL_TRAP_REVERSAL", "BEAR_TRAP_REVERSAL", "JUDAS_SWING_FADE", "VOLUME_ABSORPTION_REVERSAL"):
+            if direction == "LONG":
+                targets = [x for x in (getattr(structure, "eqh", 0.0), getattr(structure, "asian_high", 0.0), float(structure.nearest_resistance), getattr(structure, "pwh", 0.0), getattr(structure, "pdh", 0.0)) if x > last_close]
+                structural_target_tp = float(min(targets)) if targets else (last_close * 1.025)
+            elif direction == "SHORT":
+                targets = [x for x in (getattr(structure, "eql", 0.0), getattr(structure, "asian_low", 0.0), float(structure.nearest_support), getattr(structure, "pwl", 0.0), getattr(structure, "pdl", 0.0)) if 0 < x < last_close]
+                structural_target_tp = float(max(targets)) if targets else (last_close * 0.975)
+        elif setup_type == "LIQUIDITY_HUNT_REVERSAL":
+            if direction == "LONG":
+                targets = [x for x in (getattr(structure, "eqh", 0.0), getattr(structure, "asian_high", 0.0), float(structure.nearest_resistance)) if x > last_close]
+                structural_target_tp = float(max(targets)) if targets else (last_close * 1.03)
+            elif direction == "SHORT":
+                targets = [x for x in (getattr(structure, "eql", 0.0), getattr(structure, "asian_low", 0.0), float(structure.nearest_support)) if 0 < x < last_close]
+                structural_target_tp = float(min(targets)) if targets else (last_close * 0.97)
         elif direction == "LONG" and structure.nearest_resistance > last_close:
             structural_target_tp = float(structure.nearest_resistance)
         elif direction == "SHORT" and structure.nearest_support > 0.0 and structure.nearest_support < last_close:
             structural_target_tp = float(structure.nearest_support)
 
-        is_breakout = setup_type in ("HTF_BREAKOUT", "BREAKOUT_RETEST")
+        is_breakout = setup_type in ("HTF_BREAKOUT", "BREAKOUT_RETEST", "VALUE_AREA_BREAKOUT")
+        valid_setups = (
+            "SWEEP_REVERSAL", "SWEEP_AND_FVG", "FVG_RETEST", 
+            "HTF_BREAKOUT", "BREAKOUT_RETEST", "LIQUIDITY_HUNT_REVERSAL",
+            "ORDER_BLOCK_PULLBACK", "VALUE_AREA_BREAKOUT",
+            "BULL_TRAP_REVERSAL", "BEAR_TRAP_REVERSAL",
+            "JUDAS_SWING_FADE", "VOLUME_ABSORPTION_REVERSAL"
+        )
         return Signal(
             direction=direction,
-            strength=strength if (structure.is_valid or setup_type in ("SWEEP_REVERSAL", "SWEEP_AND_FVG", "FVG_RETEST", "HTF_BREAKOUT", "BREAKOUT_RETEST")) else 0.0,
+            strength=strength if (structure.is_valid or setup_type in valid_setups) else 0.0,
             entry_price=last_close,
             sl_price=last_close * 0.99 if direction == 'LONG' else last_close * 1.01,
             tp_price=(last_close * 1.04 if direction == 'LONG' else last_close * 0.96) if is_breakout else (last_close * 1.02 if direction == 'LONG' else last_close * 0.98),
@@ -382,6 +463,7 @@ class SignalGenerator:
             setup_type=setup_type,
             pattern=pattern,
             structural_target_tp=structural_target_tp,
+            trap_wick_price=float(getattr(structure, "trap_wick_extreme", 0.0)),
         )
 
 

@@ -28,7 +28,7 @@ class Candle:
 
 
 class CandleStore:
-    def __init__(self, max_len: int = 200):
+    def __init__(self, max_len: int = 5000):
         self.max_len = max_len
         # (symbol, timeframe) -> deque of Candles
         self._store: Dict[Tuple[str, str], deque[Candle]] = {}
@@ -71,7 +71,7 @@ class DeltaWSClient:
         self.max_retries = max_retries
         self.backoff_base = backoff_base
 
-        self.store = CandleStore(max_len=200)
+        self.store = CandleStore(max_len=5000)
         self.new_candle_event = asyncio.Event()
 
         self._last_message_time = 0.0
@@ -136,45 +136,63 @@ class DeltaWSClient:
 
     @staticmethod
     def calculate_htf_levels(candles: List[Candle]) -> Dict[str, float]:
-        """Calculate Previous Day High (PDH), Low (PDL), Close (PDC), and Volume POC.
+        """Calculate Previous Day High (PDH), Low (PDL), Close (PDC), Volume POC, VAH, VAL, and Asian H/L.
         
-        Uses closed candles across the recent 24h-48h window.
+        Uses closed candles across the recent 24h-48h window and up to 168h (1 week).
         """
         if not candles:
-            return {"PDH": 0.0, "PDL": 0.0, "PDC": 0.0, "POC": 0.0}
+            return {
+                "PWH": 0.0, "PWL": 0.0,
+                "PDH": 0.0, "PDL": 0.0, "PDC": 0.0, "POC": 0.0,
+                "VAH": 0.0, "VAL": 0.0, "ASIAN_HIGH": 0.0, "ASIAN_LOW": 0.0,
+            }
 
-        # Window: last 24 candles if 1h, or last 96 candles if 15m
-        window = candles[-25:-1] if len(candles) >= 25 else candles
-        if not window:
-            window = candles
+        # Daily window: last 24 candles if 1h, or last 96 candles if 15m
+        day_window = candles[-25:-1] if len(candles) >= 25 else candles
+        if not day_window:
+            day_window = candles
 
-        pdh = float(max(c.high for c in window))
-        pdl = float(min(c.low for c in window))
-        pdc = float(window[-1].close)
+        pdh = float(max(c.high for c in day_window))
+        pdl = float(min(c.low for c in day_window))
+        pdc = float(day_window[-1].close)
 
-        # Volume POC (Point of Control) calculation across window
-        num_bins = 30
-        if pdh > pdl and len(window) > 0:
-            bin_width = (pdh - pdl) / num_bins
-            bin_volumes = [0.0] * num_bins
-            for c in window:
-                typ_price = (c.high + c.low + c.close) / 3.0
-                bin_idx = min(num_bins - 1, max(0, int((typ_price - pdl) / bin_width)))
-                bin_volumes[bin_idx] += c.volume
-            max_bin = int(np.argmax(bin_volumes))
-            poc = pdl + (max_bin + 0.5) * bin_width
+        # Weekly window: last 168 candles if 1h (7 days), or last 7 candles if 1d
+        if len(candles) >= 168:
+            week_window = candles[-169:-1]
+        elif len(candles) >= 48:
+            week_window = candles[:-1]
         else:
-            poc = (pdh + pdl) / 2.0 if (pdh > 0 and pdl > 0) else 0.0
+            week_window = candles
+
+        pwh = float(max(c.high for c in week_window))
+        pwl = float(min(c.low for c in week_window))
+
+        # Deep Volume Profile across all available candles (up to 3000 candles)
+        vp_sample = candles[-3000:] if len(candles) > 3000 else candles
+        hi_arr = np.array([c.high for c in vp_sample])
+        lo_arr = np.array([c.low for c in vp_sample])
+        cl_arr = np.array([c.close for c in vp_sample])
+        vol_arr = np.array([c.volume for c in vp_sample])
+
+        from src.strategy.structure import compute_volume_profile, calculate_asian_range
+        poc, vah, val = compute_volume_profile(hi_arr, lo_arr, cl_arr, vol_arr)
+        asian_high, asian_low = calculate_asian_range(candles)
 
         return {
+            "PWH": round(pwh, 2),
+            "PWL": round(pwl, 2),
             "PDH": round(pdh, 2),
             "PDL": round(pdl, 2),
             "PDC": round(pdc, 2),
             "POC": round(float(poc), 2),
+            "VAH": round(float(vah), 2),
+            "VAL": round(float(val), 2),
+            "ASIAN_HIGH": round(float(asian_high), 2),
+            "ASIAN_LOW": round(float(asian_low), 2),
         }
 
     def get_htf_levels(self, symbol: str) -> Dict[str, float]:
-        """Get calculated HTF levels (PDH, PDL, PDC, POC) for a symbol."""
+        """Get calculated HTF levels (PWH, PWL, PDH, PDL, PDC, POC, VAH, VAL, Asian H/L) for a symbol."""
         sym_upper = symbol.upper()
         if sym_upper in self._htf_levels and self._htf_levels[sym_upper].get("PDH", 0.0) > 0:
             return self._htf_levels[sym_upper]
@@ -192,21 +210,58 @@ class DeltaWSClient:
             self._htf_levels[sym_upper] = levels
             return levels
 
-        return {"PDH": 0.0, "PDL": 0.0, "PDC": 0.0, "POC": 0.0}
+        return {
+            "PWH": 0.0, "PWL": 0.0,
+            "PDH": 0.0, "PDL": 0.0, "PDC": 0.0, "POC": 0.0,
+            "VAH": 0.0, "VAL": 0.0, "ASIAN_HIGH": 0.0, "ASIAN_LOW": 0.0,
+        }
 
     @staticmethod
     def _resolution_seconds(resolution: str) -> int:
-        if resolution == "1m":
-            return 60
-        elif resolution == "5m":
-            return 300
-        elif resolution == "15m":
-            return 900
-        elif resolution == "30m":
-            return 1800
-        elif resolution == "1h":
-            return 3600
-        return 60
+        res_map = {
+            "5s": 5, "15s": 15, "30s": 30,
+            "1m": 60, "3m": 180, "5m": 300,
+            "15m": 900, "30m": 1800,
+            "1h": 3600, "2h": 7200, "4h": 14400,
+            "1d": 86400, "1w": 604800,
+        }
+        return res_map.get(resolution, 60)
+
+    @staticmethod
+    def synthesize_sub_minute_candles(
+        candles_5s: List[Candle], target_seconds: int = 15
+    ) -> List[Candle]:
+        """Synthesize sub-minute candles (e.g. 15s, 30s) from raw 5s candles."""
+        if not candles_5s or target_seconds <= 5:
+            return candles_5s
+
+        target_ms = target_seconds * 1000
+        buckets: Dict[int, List[Candle]] = {}
+
+        for c in candles_5s:
+            bucket_key = (c.open_time // target_ms) * target_ms
+            if bucket_key not in buckets:
+                buckets[bucket_key] = []
+            buckets[bucket_key].append(c)
+
+        synthesized = []
+        for bucket_key in sorted(buckets.keys()):
+            group = buckets[bucket_key]
+            if not group:
+                continue
+            synth = Candle(
+                open_time=bucket_key,
+                open=group[0].open,
+                high=max(item.high for item in group),
+                low=min(item.low for item in group),
+                close=group[-1].close,
+                volume=sum(item.volume for item in group),
+                close_time=bucket_key + target_ms,
+                is_closed=group[-1].is_closed,
+            )
+            synthesized.append(synth)
+
+        return synthesized
 
     @staticmethod
     def _normalize_time_to_ms(t_val: Any) -> int:
@@ -224,12 +279,9 @@ class DeltaWSClient:
         return int(time.time() * 1000)
 
     def _build_subscription_payload(self) -> Dict[str, Any]:
-        channels = [
-            {"name": "candlestick_1m", "symbols": self.symbols},
-            {"name": "candlestick_5m", "symbols": self.symbols},
-            {"name": "candlestick_15m", "symbols": self.symbols},
-            {"name": "v2/ticker", "symbols": self.symbols},
-        ]
+        subscribed_tfs = list(dict.fromkeys(self.timeframes + ["1m"]))
+        channels = [{"name": f"candlestick_{tf}", "symbols": self.symbols} for tf in subscribed_tfs]
+        channels.append({"name": "v2/ticker", "symbols": self.symbols})
         return {
             "type": "subscribe",
             "payload": {
@@ -319,6 +371,32 @@ class DeltaWSClient:
                             self._seen_candles.add(seen_key)
                             self.store.add_candle(symbol, resolution, existing)
                             self.new_candle_event.set()
+
+                        if resolution == "5s":
+                            for synth_sec in (15, 30):
+                                synth_tf = f"{synth_sec}s"
+                                synth_bucket = (existing.open_time // (synth_sec * 1000)) * (synth_sec * 1000)
+                                s_key = (symbol, synth_tf)
+                                s_existing = self._forming_candles.get(s_key)
+                                if s_existing is None or s_existing.open_time < synth_bucket:
+                                    if s_existing is not None:
+                                        s_existing.is_closed = True
+                                        self.store.add_candle(symbol, synth_tf, s_existing)
+                                    self._forming_candles[s_key] = Candle(
+                                        open_time=synth_bucket,
+                                        open=existing.open,
+                                        high=existing.high,
+                                        low=existing.low,
+                                        close=existing.close,
+                                        volume=existing.volume,
+                                        close_time=synth_bucket + (synth_sec * 1000),
+                                        is_closed=False,
+                                    )
+                                else:
+                                    s_existing.high = max(s_existing.high, existing.high)
+                                    s_existing.low = min(s_existing.low, existing.low)
+                                    s_existing.close = existing.close
+                                    s_existing.volume += existing.volume
 
                         # Start new forming candle
                         self._forming_candles[key] = Candle(
@@ -438,16 +516,16 @@ class DeltaWSClient:
         heartbeat_task.cancel()
 
     async def bootstrap_historical_candles(
-        self, limit: int = 100, timeframes: Optional[List[str]] = None
+        self, limit: int = 3000, timeframes: Optional[List[str]] = None
     ) -> int:
         """
-        Pre-seed CandleStore with historical closed candles directly from Delta Exchange REST API.
+        Pre-seed CandleStore with up to 3000+ historical closed candles directly from Delta Exchange REST API.
         GET /v2/history/candles?symbol={symbol}&resolution={tf}&start={start}&end={end}
-        Ensures market structure and indicator requirements (>= 50 candles) are immediately met.
+        Ensures market structure, Volume Profile, and deep indicator requirements (EMA 200/50, HTF) are fully met.
         """
         total_bootstrapped = 0
         target_tfs = timeframes if timeframes is not None else self.timeframes
-        logger.info(f"Bootstrapping historical candles from Delta Exchange for {self.symbols} across {target_tfs}...")
+        logger.info(f"Bootstrapping historical candles (up to {limit}) from Delta Exchange for {self.symbols} across {target_tfs}...")
 
         headers = {
             "User-Agent": "python-scalping-bot",
@@ -467,6 +545,18 @@ class DeltaWSClient:
                 elif isinstance(res, Exception):
                     logger.debug(f"Historical candle task failed: {res}")
 
+        # If 5s candles were bootstrapped, automatically synthesize 15s and 30s candles
+        for sym in self.symbols:
+            c_5s = self.store.get_candles(sym, "5s")
+            if c_5s:
+                for target_sec in (15, 30):
+                    synth_tf = f"{target_sec}s"
+                    synth_candles = self.synthesize_sub_minute_candles(c_5s, target_seconds=target_sec)
+                    for sc in synth_candles:
+                        self.store.add_candle(sym, synth_tf, sc)
+                        self._seen_candles.add((sym, synth_tf, sc.open_time))
+                    total_bootstrapped += len(synth_candles)
+
         # Compute HTF levels for all symbols
         for sym in self.symbols:
             self.get_htf_levels(sym)
@@ -480,8 +570,8 @@ class DeltaWSClient:
 
         return total_bootstrapped
 
-    async def bootstrap_htf_candles(self, limit: int = 48) -> int:
-        """Fetch 1h candles specifically for higher-timeframe S/R levels."""
+    async def bootstrap_htf_candles(self, limit: int = 168) -> int:
+        """Fetch 1h candles (up to 168 = 7 days) specifically for Weekly & Daily S/R levels."""
         total = 0
         headers = {"User-Agent": "python-scalping-bot", "Content-Type": "application/json"}
         async with aiohttp.ClientSession(headers=headers) as session:

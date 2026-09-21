@@ -1,6 +1,6 @@
 import numpy as np
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Any
+from typing import List, Optional, Tuple, Any, Dict
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -31,10 +31,29 @@ class StructureAnalysis:
     pdh: float = 0.0
     pdl: float = 0.0
     poc: float = 0.0
+    vah: float = 0.0
+    val: float = 0.0
+    eqh: float = 0.0
+    eql: float = 0.0
+    asian_high: float = 0.0
+    asian_low: float = 0.0
+    ob_detected: bool = False
+    ob_direction: str = "NONE"
+    ob_top: float = 0.0
+    ob_bottom: float = 0.0
+    ob_testing: bool = False
     is_squeeze: bool = False
     squeeze_fired: bool = False
     breakout_level: float = 0.0
     breakout_direction: str = "NONE"
+    pwh: float = 0.0
+    pwl: float = 0.0
+    is_bull_trap: bool = False
+    is_bear_trap: bool = False
+    is_judas_swing: bool = False
+    is_volume_absorption: bool = False
+    trap_level: float = 0.0
+    trap_wick_extreme: float = 0.0
 
     def __post_init__(self):
         if self.support_levels is None:
@@ -96,20 +115,25 @@ def calculate_volatility_squeeze(
     return is_squeeze, squeeze_fired
 
 
-def compute_volume_poc(
+def compute_volume_profile(
     high: np.ndarray,
     low: np.ndarray,
     close: np.ndarray,
     volume: np.ndarray,
     num_bins: int = 30,
-) -> float:
-    """Calculate Volume Point of Control (POC) across given price/volume arrays."""
+    value_area_pct: float = 0.70,
+) -> Tuple[float, float, float]:
+    """Calculate Volume Point of Control (POC), Value Area High (VAH), and Value Area Low (VAL).
+    
+    Returns: (poc, vah, val)
+    """
     if len(close) == 0 or len(volume) == 0:
-        return 0.0
+        return 0.0, 0.0, 0.0
     min_p = float(np.min(low))
     max_p = float(np.max(high))
     if min_p >= max_p:
-        return float(close[-1])
+        c = float(close[-1])
+        return c, c, c
 
     bin_edges = np.linspace(min_p, max_p, num_bins + 1)
     bin_volumes = np.zeros(num_bins, dtype=float)
@@ -121,8 +145,288 @@ def compute_volume_poc(
         bin_volumes[b_idx] += float(vol)
 
     max_idx = int(np.argmax(bin_volumes))
-    poc = (bin_edges[max_idx] + bin_edges[max_idx + 1]) / 2.0
-    return float(poc)
+    poc = float((bin_edges[max_idx] + bin_edges[max_idx + 1]) / 2.0)
+
+    # 70% Value Area calculation
+    total_vol = float(np.sum(bin_volumes))
+    if total_vol <= 0:
+        return poc, float(max_p), float(min_p)
+
+    target_vol = total_vol * value_area_pct
+    current_vol = float(bin_volumes[max_idx])
+    lower_idx = max_idx
+    upper_idx = max_idx
+
+    while current_vol < target_vol and (lower_idx > 0 or upper_idx < num_bins - 1):
+        vol_above = float(bin_volumes[upper_idx + 1]) if upper_idx < num_bins - 1 else 0.0
+        vol_below = float(bin_volumes[lower_idx - 1]) if lower_idx > 0 else 0.0
+
+        if vol_above >= vol_below and upper_idx < num_bins - 1:
+            upper_idx += 1
+            current_vol += vol_above
+        elif lower_idx > 0:
+            lower_idx -= 1
+            current_vol += vol_below
+        elif upper_idx < num_bins - 1:
+            upper_idx += 1
+            current_vol += vol_above
+        else:
+            break
+
+    val = float(bin_edges[lower_idx])
+    vah = float(bin_edges[upper_idx + 1])
+    return poc, vah, val
+
+
+def compute_volume_poc(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    volume: np.ndarray,
+    num_bins: int = 30,
+) -> float:
+    """Calculate Volume Point of Control (POC) across given price/volume arrays."""
+    poc, _, _ = compute_volume_profile(high, low, close, volume, num_bins=num_bins)
+    return poc
+
+
+def detect_equal_highs_lows(
+    high: np.ndarray,
+    low: np.ndarray,
+    swing_highs: List[int],
+    swing_lows: List[int],
+    tolerance_pct: float = 0.0005,
+) -> Tuple[float, float]:
+    """Detect Equal Highs (EQH - Buy-Side Liquidity) and Equal Lows (EQL - Sell-Side Liquidity).
+    
+    Returns: (eqh_price, eql_price)
+    """
+    eqh = 0.0
+    eql = 0.0
+
+    # Scan pairs of recent swing highs
+    if len(swing_highs) >= 2:
+        for i in range(len(swing_highs) - 1, 0, -1):
+            h1 = float(high[swing_highs[i]])
+            h2 = float(high[swing_highs[i - 1]])
+            if h1 > 0 and abs(h1 - h2) / h1 <= tolerance_pct:
+                eqh = (h1 + h2) / 2.0
+                break
+
+    # Scan pairs of recent swing lows
+    if len(swing_lows) >= 2:
+        for i in range(len(swing_lows) - 1, 0, -1):
+            l1 = float(low[swing_lows[i]])
+            l2 = float(low[swing_lows[i - 1]])
+            if l1 > 0 and abs(l1 - l2) / l1 <= tolerance_pct:
+                eql = (l1 + l2) / 2.0
+                break
+
+    return eqh, eql
+
+
+def detect_order_blocks(
+    open_arr: np.ndarray,
+    high_arr: np.ndarray,
+    low_arr: np.ndarray,
+    close_arr: np.ndarray,
+    lookback: int = 15,
+    displacement_threshold: float = 0.6,
+) -> Tuple[bool, str, float, float, bool]:
+    """Detect Institutional Order Block (OB) and evaluate current price testing/mitigation.
+    
+    Definition:
+    - Bullish OB: Last down candle (close < open) prior to a bullish displacement candle.
+    - Bearish OB: Last up candle (close > open) prior to a bearish displacement candle.
+    
+    Returns: (ob_detected, ob_direction, ob_top, ob_bottom, ob_testing)
+    """
+    n = len(close_arr)
+    if n < 4:
+        return False, "NONE", 0.0, 0.0, False
+
+    cur_price = float(close_arr[-1])
+    scan_limit = min(lookback, n - 2)
+
+    for offset in range(1, scan_limit + 1):
+        i = n - offset
+        if i < 2:
+            break
+
+        # Check for displacement move on candle i
+        body = abs(close_arr[i] - open_arr[i])
+        rng = high_arr[i] - low_arr[i]
+        if rng <= 0 or (body / rng) < displacement_threshold:
+            continue
+
+        # Bullish displacement: green candle with large body breaking prior high
+        if close_arr[i] > open_arr[i] and close_arr[i] > high_arr[i - 1]:
+            for j in range(i - 1, max(-1, i - 4), -1):
+                if close_arr[j] <= open_arr[j]:  # Bearish origin candle
+                    ob_top = float(high_arr[j])
+                    ob_bottom = float(low_arr[j])
+                    broken = np.any(close_arr[i:] < ob_bottom)
+                    if not broken:
+                        is_testing = (ob_bottom <= cur_price <= ob_top) or (low_arr[-1] <= ob_top and cur_price >= ob_bottom and cur_price <= ob_top * 1.005)
+                        return True, "BULLISH", ob_top, ob_bottom, bool(is_testing)
+
+        # Bearish displacement: red candle with large body breaking prior low
+        elif close_arr[i] < open_arr[i] and close_arr[i] < low_arr[i - 1]:
+            for j in range(i - 1, max(-1, i - 4), -1):
+                if close_arr[j] >= open_arr[j]:  # Bullish origin candle
+                    ob_top = float(high_arr[j])
+                    ob_bottom = float(low_arr[j])
+                    broken = np.any(close_arr[i:] > ob_top)
+                    if not broken:
+                        is_testing = (ob_bottom <= cur_price <= ob_top) or (high_arr[-1] >= ob_bottom and cur_price <= ob_top and cur_price >= ob_bottom * 0.995)
+                        return True, "BEARISH", ob_top, ob_bottom, bool(is_testing)
+
+    return False, "NONE", 0.0, 0.0, False
+
+
+def calculate_asian_range(candles: Any) -> Tuple[float, float]:
+    """Calculate Asian Session (00:00 - 08:00 UTC) High and Low.
+    
+    Returns: (asian_high, asian_low)
+    """
+    if not candles:
+        return 0.0, 0.0
+
+    asian_highs = []
+    asian_lows = []
+
+    for c in candles:
+        open_time = getattr(c, "open_time", None) if not isinstance(c, dict) else c.get("open_time")
+        hi = getattr(c, "high", None) if not isinstance(c, dict) else c.get("high")
+        lo = getattr(c, "low", None) if not isinstance(c, dict) else c.get("low")
+        if open_time and hi is not None and lo is not None:
+            try:
+                from datetime import datetime, timezone
+                ts = float(open_time) / 1000.0 if float(open_time) > 1e11 else float(open_time)
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                if 0 <= dt.hour < 8:
+                    asian_highs.append(float(hi))
+                    asian_lows.append(float(lo))
+            except Exception:
+                pass
+
+    if asian_highs and asian_lows:
+        return float(np.max(asian_highs)), float(np.min(asian_lows))
+
+    if len(candles) >= 32:
+        slice_32 = candles[:32]
+        his = [c.high if not isinstance(c, dict) else c['high'] for c in slice_32]
+        los = [c.low if not isinstance(c, dict) else c['low'] for c in slice_32]
+        return float(np.max(his)), float(np.min(los))
+
+    return 0.0, 0.0
+
+
+def detect_trap_market(
+    op: np.ndarray,
+    hi: np.ndarray,
+    lo: np.ndarray,
+    cl: np.ndarray,
+    vol: np.ndarray,
+    key_levels: Dict[str, float],
+    atr: float = 0.0,
+    wick_ratio_threshold: float = 0.20,
+    cur_timestamp_ms: Optional[int] = None,
+) -> Tuple[bool, bool, bool, bool, str, float, float]:
+    """Detect institutional trap market patterns:
+    1. Bull Trap / Buy-Side SFP:
+       Price breaches an upper key level (Resistance, EQH, PDH, PWH, VAH),
+       then violently rejects and closes below it with an upper wick.
+    2. Bear Trap / Sell-Side SFP:
+       Price plunges below a lower key level (Support, EQL, PDL, PWL, VAL),
+       then snaps back and closes above it with a lower wick.
+    3. Judas Swing:
+       Session open manipulation (London Open 07:00-09:00 UTC or NY Open 13:00-15:00 UTC)
+       sweeping Asian High or Asian Low and reversing into the range.
+    4. Volume Absorption:
+       High volume spike (>= 2.2x SMA20) on compressed body (<= 0.35 range) at a key level.
+
+    Returns:
+        (is_bull_trap, is_bear_trap, is_judas_swing, is_volume_absorption,
+         trap_type, trap_level, trap_wick_extreme)
+    """
+    n = len(cl)
+    if n < 2:
+        return False, False, False, False, "NONE", 0.0, 0.0
+
+    cur_o, cur_h, cur_l, cur_c = op[-1], hi[-1], lo[-1], cl[-1]
+    rng = cur_h - cur_l
+    if rng <= 0:
+        return False, False, False, False, "NONE", 0.0, 0.0
+
+    upper_wick = cur_h - max(cur_o, cur_c)
+    lower_wick = min(cur_o, cur_c) - cur_l
+    body = abs(cur_c - cur_o)
+
+    upper_wick_ratio = upper_wick / rng
+    lower_wick_ratio = lower_wick / rng
+
+    # Check for session manipulation window (Judas Swing)
+    is_session_window = False
+    if cur_timestamp_ms:
+        try:
+            from datetime import datetime, timezone
+            ts = float(cur_timestamp_ms) / 1000.0 if float(cur_timestamp_ms) > 1e11 else float(cur_timestamp_ms)
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            if (7 <= dt.hour <= 9) or (12 <= dt.hour <= 15):
+                is_session_window = True
+        except Exception:
+            pass
+
+    # Upper key levels for Bull Trap / Buy-side liquidity hunt
+    upper_levels = [
+        ("PWH", key_levels.get("PWH", 0.0)),
+        ("PDH", key_levels.get("PDH", 0.0)),
+        ("EQH", key_levels.get("EQH", 0.0)),
+        ("RESISTANCE", key_levels.get("NEAREST_RESISTANCE", 0.0)),
+        ("VAH", key_levels.get("VAH", 0.0)),
+        ("ASIAN_HIGH", key_levels.get("ASIAN_HIGH", 0.0)),
+    ]
+
+    # Lower key levels for Bear Trap / Sell-side liquidity hunt
+    lower_levels = [
+        ("PWL", key_levels.get("PWL", 0.0)),
+        ("PDL", key_levels.get("PDL", 0.0)),
+        ("EQL", key_levels.get("EQL", 0.0)),
+        ("SUPPORT", key_levels.get("NEAREST_SUPPORT", 0.0)),
+        ("VAL", key_levels.get("VAL", 0.0)),
+        ("ASIAN_LOW", key_levels.get("ASIAN_LOW", 0.0)),
+    ]
+
+    # 1. Bull Trap Detection (Buy-side SFP)
+    for name, lvl in upper_levels:
+        if lvl and lvl > 0:
+            if cur_h > lvl and cur_c < lvl and cur_h > hi[-2]:
+                if upper_wick_ratio >= wick_ratio_threshold or cur_c <= cur_o:
+                    is_judas = (name == "ASIAN_HIGH" and is_session_window)
+                    trap_type = "JUDAS_SWING_HIGH" if is_judas else f"BULL_TRAP_{name}"
+                    return True, False, is_judas, False, trap_type, float(lvl), float(cur_h)
+
+    # 2. Bear Trap Detection (Sell-side SFP)
+    for name, lvl in lower_levels:
+        if lvl and lvl > 0:
+            if cur_l < lvl and cur_c > lvl and cur_l < lo[-2]:
+                if lower_wick_ratio >= wick_ratio_threshold or cur_c >= cur_o:
+                    is_judas = (name == "ASIAN_LOW" and is_session_window)
+                    trap_type = "JUDAS_SWING_LOW" if is_judas else f"BEAR_TRAP_{name}"
+                    return False, True, is_judas, False, trap_type, float(lvl), float(cur_l)
+
+    # 3. Volume Absorption Detection
+    if len(vol) >= 20:
+        avg_vol = float(np.mean(vol[-20:]))
+        rel_vol = (vol[-1] / avg_vol) if avg_vol > 0 else 1.0
+        if rel_vol >= 2.2 and (body / rng) <= 0.35:
+            if upper_wick_ratio >= 0.40:
+                return True, False, False, True, "VOLUME_ABSORPTION_HIGH", float(cur_h), float(cur_h)
+            elif lower_wick_ratio >= 0.40:
+                return False, True, False, True, "VOLUME_ABSORPTION_LOW", float(cur_l), float(cur_l)
+
+    return False, False, False, False, "NONE", 0.0, 0.0
 
 
 class MarketStructure:
@@ -285,15 +589,38 @@ class MarketStructure:
         # 15m analysis
         op_15, hi_15, lo_15, cl_15, vol_15 = self._extract_arrays(candles_15m)
 
-        # Higher-Timeframe (HTF) S/R & POC Levels
+        # Higher-Timeframe (HTF) S/R, Volume Profile & Asian Range Levels
+        pwh = float(htf_levels.get("PWH", 0.0)) if (htf_levels and isinstance(htf_levels, dict)) else 0.0
+        pwl = float(htf_levels.get("PWL", 0.0)) if (htf_levels and isinstance(htf_levels, dict)) else 0.0
         pdh = float(htf_levels.get("PDH", 0.0)) if (htf_levels and isinstance(htf_levels, dict)) else 0.0
         pdl = float(htf_levels.get("PDL", 0.0)) if (htf_levels and isinstance(htf_levels, dict)) else 0.0
         poc = float(htf_levels.get("POC", 0.0)) if (htf_levels and isinstance(htf_levels, dict)) else 0.0
+        vah = float(htf_levels.get("VAH", 0.0)) if (htf_levels and isinstance(htf_levels, dict)) else 0.0
+        val = float(htf_levels.get("VAL", 0.0)) if (htf_levels and isinstance(htf_levels, dict)) else 0.0
+        asian_high = float(htf_levels.get("ASIAN_HIGH", 0.0)) if (htf_levels and isinstance(htf_levels, dict)) else 0.0
+        asian_low = float(htf_levels.get("ASIAN_LOW", 0.0)) if (htf_levels and isinstance(htf_levels, dict)) else 0.0
+
+        if (poc == 0.0 or vah == 0.0 or val == 0.0) and len(cl_15) >= 20 and len(vol_15) >= 20:
+            calc_poc, calc_vah, calc_val = compute_volume_profile(hi_15, lo_15, cl_15, vol_15)
+            if poc == 0.0:
+                poc = calc_poc
+            if vah == 0.0:
+                vah = calc_vah
+            if val == 0.0:
+                val = calc_val
 
         if (pdh == 0.0 or pdl == 0.0) and len(cl_15) >= 20:
             pdh = float(np.max(hi_15))
             pdl = float(np.min(lo_15))
-            poc = compute_volume_poc(hi_15, lo_15, cl_15, vol_15)
+
+        if asian_high == 0.0 and asian_low == 0.0:
+            calc_ah, calc_al = calculate_asian_range(candles_15m)
+            if calc_ah == 0.0 and calc_al == 0.0:
+                calc_ah, calc_al = calculate_asian_range(candles_5m)
+            if asian_high == 0.0:
+                asian_high = calc_ah
+            if asian_low == 0.0:
+                asian_low = calc_al
 
         bias_15m = 'NEUTRAL'
         lookback_15 = min(self.lookback, 4)
@@ -362,9 +689,11 @@ class MarketStructure:
         bos_direction_5m = 'NONE'
         liquidity_sweep_5m = False
         broken_level_5m: Optional[float] = None
+        eqh, eql = 0.0, 0.0
         
         if len(hi_5) > 2 * self.lookback:
             sh_5, sl_5 = self.find_swing_points(hi_5, lo_5)
+            eqh, eql = detect_equal_highs_lows(hi_5, lo_5, sh_5, sl_5)
             
             # Check Break of Structure and CHoCH
             if sh_5 and cl_5[-1] > hi_5[sh_5[-1]]:
@@ -399,10 +728,16 @@ class MarketStructure:
                         if (wick_beyond / total_range) > self.wick_ratio_threshold:
                             liquidity_sweep_5m = True
 
+        # Order Block detection (5m primary, 1m fallback)
+        ob_detected, ob_direction, ob_top, ob_bottom, ob_testing = detect_order_blocks(op_5, hi_5, lo_5, cl_5)
+
         # 1m analysis
         op_1, hi_1, lo_1, cl_1, vol_1 = self._extract_arrays(candles_1m)
         displacement_1m = False
         retest_1m = False
+
+        if not ob_detected and len(cl_1) >= 4:
+            ob_detected, ob_direction, ob_top, ob_bottom, ob_testing = detect_order_blocks(op_1, hi_1, lo_1, cl_1)
         
         if len(cl_1) > 0:
             body = abs(cl_1[-1] - op_1[-1])
@@ -471,6 +806,51 @@ class MarketStructure:
                 if rng_1 > 0 and (wick / rng_1) >= 0.30:
                     liquidity_sweep_5m = True
                     sweep_direction = 'BEARISH'
+
+            # Sweep of Equal Highs (EQH - Buy-Side Liquidity hunt)
+            if eqh > 0 and hi_1[-1] > eqh and cl_1[-1] < eqh:
+                wick = hi_1[-1] - eqh
+                rng_1 = hi_1[-1] - lo_1[-1]
+                if rng_1 > 0 and (wick / rng_1) >= 0.20:
+                    liquidity_sweep_5m = True
+                    sweep_direction = 'BEARISH'
+
+            # Sweep of Equal Lows (EQL - Sell-Side Liquidity hunt)
+            if eql > 0 and lo_1[-1] < eql and cl_1[-1] > eql:
+                wick = eql - lo_1[-1]
+                rng_1 = hi_1[-1] - lo_1[-1]
+                if rng_1 > 0 and (wick / rng_1) >= 0.20:
+                    liquidity_sweep_5m = True
+                    sweep_direction = 'BULLISH'
+
+            # Sweep of Asian High / Low
+            if asian_high > 0 and hi_1[-1] > asian_high and cl_1[-1] < asian_high:
+                wick = hi_1[-1] - asian_high
+                rng_1 = hi_1[-1] - lo_1[-1]
+                if rng_1 > 0 and (wick / rng_1) >= 0.20:
+                    liquidity_sweep_5m = True
+                    sweep_direction = 'BEARISH'
+            elif asian_low > 0 and lo_1[-1] < asian_low and cl_1[-1] > asian_low:
+                wick = asian_low - lo_1[-1]
+                rng_1 = hi_1[-1] - lo_1[-1]
+                if rng_1 > 0 and (wick / rng_1) >= 0.20:
+                    liquidity_sweep_5m = True
+                    sweep_direction = 'BULLISH'
+
+        # Also fallback sweep checks from 5m candle if 1m didn't trigger
+        if sweep_direction == 'NONE':
+            if eqh > 0 and len(hi_5) > 0 and hi_5[-1] > eqh and cl_5[-1] < eqh:
+                liquidity_sweep_5m = True
+                sweep_direction = 'BEARISH'
+            elif eql > 0 and len(lo_5) > 0 and lo_5[-1] < eql and cl_5[-1] > eql:
+                liquidity_sweep_5m = True
+                sweep_direction = 'BULLISH'
+            elif asian_high > 0 and len(hi_5) > 0 and hi_5[-1] > asian_high and cl_5[-1] < asian_high:
+                liquidity_sweep_5m = True
+                sweep_direction = 'BEARISH'
+            elif asian_low > 0 and len(lo_5) > 0 and lo_5[-1] < asian_low and cl_5[-1] > asian_low:
+                liquidity_sweep_5m = True
+                sweep_direction = 'BULLISH'
 
         # Also from 5m liquidity sweep:
         if sweep_direction == 'NONE' and liquidity_sweep_5m:
@@ -567,7 +947,47 @@ class MarketStructure:
                             breakout_direction = "BEARISH"
                             breakout_level = pdl
 
-        # Determine Setup Type with high-probability ICT and HTF Breakout confluence
+        # Collect key levels dictionary for trap market detection
+        key_levels_dict = {
+            "PWH": pwh, "PWL": pwl,
+            "PDH": pdh, "PDL": pdl,
+            "EQH": eqh, "EQL": eql,
+            "NEAREST_RESISTANCE": nearest_resistance,
+            "NEAREST_SUPPORT": nearest_support,
+            "VAH": vah, "VAL": val,
+            "ASIAN_HIGH": asian_high, "ASIAN_LOW": asian_low,
+        }
+
+        # Timestamp of the latest candle
+        latest_ts = None
+        if isinstance(candles_1m, list) and len(candles_1m) > 0:
+            last_c = candles_1m[-1]
+            latest_ts = getattr(last_c, "open_time", None) if not isinstance(last_c, dict) else last_c.get("open_time")
+        elif isinstance(candles_1m, dict) and "open_time" in candles_1m and len(candles_1m["open_time"]) > 0:
+            latest_ts = candles_1m["open_time"][-1]
+
+        # Run Trap Market Detection on 1m candles (fallback to 5m)
+        is_bull_trap, is_bear_trap, is_judas_swing, is_vol_abs, trap_type_str, trap_lvl, trap_wick_ext = (
+            detect_trap_market(
+                op_1, hi_1, lo_1, cl_1, vol_1,
+                key_levels=key_levels_dict,
+                atr=atr_1m,
+                wick_ratio_threshold=0.20,
+                cur_timestamp_ms=latest_ts,
+            )
+        )
+        if not (is_bull_trap or is_bear_trap or is_judas_swing or is_vol_abs) and len(cl_5) >= 2:
+            is_bull_trap, is_bear_trap, is_judas_swing, is_vol_abs, trap_type_str, trap_lvl, trap_wick_ext = (
+                detect_trap_market(
+                    op_5, hi_5, lo_5, cl_5, vol_5,
+                    key_levels=key_levels_dict,
+                    atr=atr_1m * 2.0,
+                    wick_ratio_threshold=0.25,
+                    cur_timestamp_ms=latest_ts,
+                )
+            )
+
+        # Determine Setup Type with high-probability ICT, Trap Market, and HTF Breakout confluence
         setup_type = "NONE"
         if breakout_detected:
             setup_type = "HTF_BREAKOUT"
@@ -575,6 +995,41 @@ class MarketStructure:
             invalidation_reason = None
         elif retest_detected:
             setup_type = "BREAKOUT_RETEST"
+            is_valid = True
+            invalidation_reason = None
+        elif (
+            vah > 0 and len(cl_1) >= 2 and cl_1[-1] > vah and (cl_1[-2] <= vah or is_squeeze or squeeze_fired)
+            and displacement_1m
+        ):
+            setup_type = "VALUE_AREA_BREAKOUT"
+            breakout_direction = "BULLISH"
+            breakout_level = vah
+            is_valid = True
+            invalidation_reason = None
+        elif (
+            val > 0 and len(cl_1) >= 2 and cl_1[-1] < val and (cl_1[-2] >= val or is_squeeze or squeeze_fired)
+            and displacement_1m
+        ):
+            setup_type = "VALUE_AREA_BREAKOUT"
+            breakout_direction = "BEARISH"
+            breakout_level = val
+            is_valid = True
+            invalidation_reason = None
+        elif liquidity_sweep_5m and (
+            (eqh > 0 and sweep_direction == 'BEARISH') or
+            (eql > 0 and sweep_direction == 'BULLISH') or
+            (asian_high > 0 and sweep_direction == 'BEARISH') or
+            (asian_low > 0 and sweep_direction == 'BULLISH')
+        ):
+            # Liquidity hunt on engineered liquidity pools (EQH/EQL or Asian H/L)
+            setup_type = "LIQUIDITY_HUNT_REVERSAL"
+            is_valid = True
+            invalidation_reason = None
+        elif ob_detected and ob_testing and not retest_1m and (
+            (ob_direction == "BULLISH" and bias_15m == "BULLISH") or
+            (ob_direction == "BEARISH" and bias_15m == "BEARISH")
+        ):
+            setup_type = "ORDER_BLOCK_PULLBACK"
             is_valid = True
             invalidation_reason = None
         elif liquidity_sweep_5m and fvg_detected and sweep_direction == fvg_dir:
@@ -585,6 +1040,26 @@ class MarketStructure:
         elif liquidity_sweep_5m and sweep_direction in ('BULLISH', 'BEARISH'):
             setup_type = "SWEEP_REVERSAL"
             # A sweep of support/resistance is an intentional reversal scalp; mark valid
+            is_valid = True
+            invalidation_reason = None
+        elif is_judas_swing:
+            setup_type = "JUDAS_SWING_FADE"
+            sweep_direction = "BEARISH" if is_bull_trap else "BULLISH"
+            is_valid = True
+            invalidation_reason = None
+        elif is_bull_trap:
+            setup_type = "BULL_TRAP_REVERSAL"
+            sweep_direction = "BEARISH"
+            is_valid = True
+            invalidation_reason = None
+        elif is_bear_trap:
+            setup_type = "BEAR_TRAP_REVERSAL"
+            sweep_direction = "BULLISH"
+            is_valid = True
+            invalidation_reason = None
+        elif is_vol_abs:
+            setup_type = "VOLUME_ABSORPTION_REVERSAL"
+            sweep_direction = "BEARISH" if is_bull_trap else "BULLISH"
             is_valid = True
             invalidation_reason = None
         elif fvg_detected and fvg_testing and (
@@ -624,8 +1099,27 @@ class MarketStructure:
             pdh=pdh,
             pdl=pdl,
             poc=poc,
+            vah=vah,
+            val=val,
+            eqh=eqh,
+            eql=eql,
+            asian_high=asian_high,
+            asian_low=asian_low,
+            ob_detected=ob_detected,
+            ob_direction=ob_direction,
+            ob_top=ob_top,
+            ob_bottom=ob_bottom,
+            ob_testing=ob_testing,
             is_squeeze=is_squeeze,
             squeeze_fired=squeeze_fired,
             breakout_level=breakout_level,
             breakout_direction=breakout_direction,
+            pwh=pwh,
+            pwl=pwl,
+            is_bull_trap=is_bull_trap,
+            is_bear_trap=is_bear_trap,
+            is_judas_swing=is_judas_swing,
+            is_volume_absorption=is_vol_abs,
+            trap_level=trap_lvl,
+            trap_wick_extreme=trap_wick_ext,
         )

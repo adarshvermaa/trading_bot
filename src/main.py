@@ -318,6 +318,29 @@ class ScalpingBot:
                         )
                         logger.info(f"[TRAILING SL] {symbol}: {msg}")
 
+                    # 1b-iii. Structural Swing Trailing Stop Loss (1m Swing Points)
+                    c_1m = self.ws_client.store.get_candles(symbol, "1m") if (hasattr(self, "ws_client") and self.ws_client) else []
+                    if c_1m and len(c_1m) >= 5:
+                        struct_sl, struct_updated, struct_msg = self.risk_manager.calculate_structural_trailing_stop_loss(
+                            entry_price=active.entry_price,
+                            side=active.side,
+                            current_price=live_price,
+                            current_sl=active.sl_price or 0.0,
+                            candles_1m=c_1m,
+                            tick_size=tick_size,
+                        )
+                        if struct_updated:
+                            self.order_manager.update_active_sl(struct_sl)
+                            await self.delta_client.update_bracket_stop_loss(
+                                product_id,
+                                struct_sl,
+                                tick_size,
+                                order_id=active.order_id,
+                                side=active.side,
+                                size=active.size,
+                            )
+                            logger.info(f"[STRUCTURAL TRAILING SL] {symbol}: {struct_msg}")
+
                 # --- 2. Check SL/TP triggers (Dual-Layer: Live Exchange Execution + Bot Failsafe) ---
                 trigger_reason: Optional[str] = None
                 if not self.delta_client.live_trading and product_id:
@@ -576,6 +599,17 @@ class ScalpingBot:
                 "pdh": getattr(e["structure"], "pdh", 0.0),
                 "pdl": getattr(e["structure"], "pdl", 0.0),
                 "poc": getattr(e["structure"], "poc", 0.0),
+                "vah": getattr(e["structure"], "vah", 0.0),
+                "val": getattr(e["structure"], "val", 0.0),
+                "eqh": getattr(e["structure"], "eqh", 0.0),
+                "eql": getattr(e["structure"], "eql", 0.0),
+                "asian_high": getattr(e["structure"], "asian_high", 0.0),
+                "asian_low": getattr(e["structure"], "asian_low", 0.0),
+                "ob_detected": getattr(e["structure"], "ob_detected", False),
+                "ob_direction": getattr(e["structure"], "ob_direction", "NONE"),
+                "ob_top": getattr(e["structure"], "ob_top", 0.0),
+                "ob_bottom": getattr(e["structure"], "ob_bottom", 0.0),
+                "ob_testing": getattr(e["structure"], "ob_testing", False),
                 "is_squeeze": getattr(e["structure"], "is_squeeze", False),
                 "squeeze_fired": getattr(e["structure"], "squeeze_fired", False),
                 "breakout_direction": getattr(e["structure"], "breakout_direction", "NONE"),
@@ -803,6 +837,7 @@ class ScalpingBot:
                                 order_type=chosen_order_type,
                                 structural_target_tp=getattr(setup["signal"], "structural_target_tp", None),
                                 setup_type=getattr(setup["signal"], "setup_type", "NONE"),
+                                trap_wick_price=getattr(setup["signal"], "trap_wick_price", None),
                             )
 
                             self._position_health = "STRONG"
@@ -973,11 +1008,12 @@ class ScalpingBot:
         # Daily reset check
         self.risk_manager.reset_daily()
 
-        # Pre-seed historical market data for immediate strategy execution
-        logger.info("Pre-seeding historical market data from Delta Exchange...")
+        # Pre-seed deep historical market data (3000+ candles from 5s to HTF)
+        logger.info("Pre-seeding deep historical market data (3000+ candles) from Delta Exchange...")
         try:
-            bootstrapped = await self.delta_ws.bootstrap_historical_candles(limit=100)
-            logger.info(f"Market data bootstrapped: {bootstrapped} candles loaded.")
+            bootstrapped = await self.delta_ws.bootstrap_historical_candles(limit=3000)
+            await self.delta_ws.bootstrap_htf_candles(limit=168)
+            logger.info(f"Market data bootstrapped: {bootstrapped} candles loaded across multiple timeframes.")
         except Exception as e:
             logger.warning(f"Candle bootstrapping issue: {e}")
 

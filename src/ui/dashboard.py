@@ -94,6 +94,30 @@ class Dashboard:
             htf_str = f"PDH=${btc_pdh:,.2f} | PDL=${btc_pdl:,.2f}" + (f" | POC=${btc_poc:,.2f}" if btc_poc else "")
             table.add_row("BTC HTF Levels", Text(f": {htf_str}", style="cyan"))
 
+        btc_vah = btc.get("vah", 0.0)
+        btc_val = btc.get("val", 0.0)
+        if btc_vah or btc_val:
+            table.add_row("BTC Value Area", Text(f": VAH=${btc_vah:,.2f} | VAL=${btc_val:,.2f}", style="cyan"))
+
+        btc_eqh = btc.get("eqh", 0.0)
+        btc_eql = btc.get("eql", 0.0)
+        btc_ah = btc.get("asian_high", 0.0)
+        btc_al = btc.get("asian_low", 0.0)
+        btc_liq = []
+        if btc_eqh: btc_liq.append(f"EQH=${btc_eqh:,.2f}")
+        if btc_eql: btc_liq.append(f"EQL=${btc_eql:,.2f}")
+        if btc_ah: btc_liq.append(f"AsianH=${btc_ah:,.2f}")
+        if btc_al: btc_liq.append(f"AsianL=${btc_al:,.2f}")
+        if btc_liq:
+            table.add_row("BTC Liquidity", Text(f": {' | '.join(btc_liq)}", style="magenta"))
+
+        if btc.get("ob_detected"):
+            ob_d = btc.get("ob_direction", "NONE")
+            ob_b = btc.get("ob_bottom", 0.0)
+            ob_t = btc.get("ob_top", 0.0)
+            mit_str = " (Testing)" if btc.get("ob_testing") else ""
+            table.add_row("BTC Order Block", Text(f": {ob_d} [${ob_b:,.2f}-${ob_t:,.2f}]{mit_str}", style="bold green" if ob_d == "BULLISH" else "bold red"))
+
         if btc.get("squeeze_fired"):
             table.add_row("BTC Squeeze", Text(": SQUEEZE FIRED! (Expansion)", style="bold green"))
         elif btc.get("is_squeeze"):
@@ -125,6 +149,30 @@ class Dashboard:
         if eth_pdh or eth_pdl:
             htf_str = f"PDH=${eth_pdh:,.2f} | PDL=${eth_pdl:,.2f}" + (f" | POC=${eth_poc:,.2f}" if eth_poc else "")
             table.add_row("ETH HTF Levels", Text(f": {htf_str}", style="cyan"))
+
+        eth_vah = eth.get("vah", 0.0)
+        eth_val = eth.get("val", 0.0)
+        if eth_vah or eth_val:
+            table.add_row("ETH Value Area", Text(f": VAH=${eth_vah:,.2f} | VAL=${eth_val:,.2f}", style="cyan"))
+
+        eth_eqh = eth.get("eqh", 0.0)
+        eth_eql = eth.get("eql", 0.0)
+        eth_ah = eth.get("asian_high", 0.0)
+        eth_al = eth.get("asian_low", 0.0)
+        eth_liq = []
+        if eth_eqh: eth_liq.append(f"EQH=${eth_eqh:,.2f}")
+        if eth_eql: eth_liq.append(f"EQL=${eth_eql:,.2f}")
+        if eth_ah: eth_liq.append(f"AsianH=${eth_ah:,.2f}")
+        if eth_al: eth_liq.append(f"AsianL=${eth_al:,.2f}")
+        if eth_liq:
+            table.add_row("ETH Liquidity", Text(f": {' | '.join(eth_liq)}", style="magenta"))
+
+        if eth.get("ob_detected"):
+            ob_d = eth.get("ob_direction", "NONE")
+            ob_b = eth.get("ob_bottom", 0.0)
+            ob_t = eth.get("ob_top", 0.0)
+            mit_str = " (Testing)" if eth.get("ob_testing") else ""
+            table.add_row("ETH Order Block", Text(f": {ob_d} [${ob_b:,.2f}-${ob_t:,.2f}]{mit_str}", style="bold green" if ob_d == "BULLISH" else "bold red"))
 
         if eth.get("squeeze_fired"):
             table.add_row("ETH Squeeze", Text(": SQUEEZE FIRED! (Expansion)", style="bold green"))
@@ -251,6 +299,14 @@ class Dashboard:
             sr_text = f": S=${sup:,.2f} | R=${res:,.2f}" if sup and res else (f": S=${sup:,.2f}" if sup else f": R=${res:,.2f}")
             table.add_row("S/R Levels", Text(sr_text, style="yellow"))
 
+        # Routing & Trailing Mode
+        routing = self.position_data.get('execution_routing') or self.execution_data.get('execution_routing', 'HYBRID_OPTIMIZED')
+        if "LIMIT" in routing:
+            table.add_row("Routing", Text(": LIMIT (Maker 0.02% Fee)", style="bold green"))
+        else:
+            table.add_row("Routing", Text(": MARKET (Momentum Breakout)", style="bold cyan"))
+        table.add_row("Trailing Mode", ": Stepped Margin + 1M Structural Swing")
+
         # Position health
         health = self.position_data.get('health', '--')
         if health and health != "--":
@@ -353,6 +409,8 @@ class Dashboard:
         table.add_row("Status", status_text)
         table.add_row("Fill Price", f": {self.execution_data.get('fill_price', '--')}")
         table.add_row("Fees", f": {self.execution_data.get('fees', '--')}")
+        routing = self.execution_data.get('execution_routing', 'HYBRID_OPTIMIZED')
+        table.add_row("Routing Mode", Text(f": {routing}", style="bold cyan"))
         table.add_row("Last Event", event_text)
         
         return Panel(table, title="EXECUTION", border_style=border_col)

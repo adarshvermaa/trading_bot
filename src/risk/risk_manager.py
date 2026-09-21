@@ -91,7 +91,8 @@ class RiskManager:
 
     def calculate_stop_loss(self, entry_price: float, side: str, margin: float, leverage: int, 
                             contract_value: float, size: int, atr: float, 
-                            tick_size: Optional[float] = None) -> Tuple[float, bool, str]:
+                            tick_size: Optional[float] = None,
+                            trap_wick_price: Optional[float] = None) -> Tuple[float, bool, str]:
         
         max_loss_pct = self.config.stop_loss.max_loss_pct_of_margin
         loss_amount = margin * max_loss_pct
@@ -103,12 +104,27 @@ class RiskManager:
         else:
             price_diff = entry_price * (max_loss_pct / max(1, leverage))
         
-        if side.upper() in ('LONG', 'BUY'):
+        is_long = side.upper() in ('LONG', 'BUY')
+        if is_long:
             sl_price = max(0.0, entry_price - price_diff)
+            # If trap wick price is provided (e.g. wick low of a bear trap), place SL 1 tick below it
+            if trap_wick_price and 0 < trap_wick_price < entry_price:
+                tick_buf = tick_size if (tick_size and tick_size > 0) else (entry_price * 0.0005)
+                candidate_wick_sl = trap_wick_price - tick_buf
+                # Only use wick SL if it is tighter than or equal to max margin loss
+                if candidate_wick_sl > sl_price:
+                    sl_price = candidate_wick_sl
             if tick_size and tick_size > 0:
                 sl_price = round_to_tick(sl_price, tick_size, direction='DOWN')
         else:
             sl_price = entry_price + price_diff
+            # If trap wick price is provided (e.g. wick high of a bull trap), place SL 1 tick above it
+            if trap_wick_price and trap_wick_price > entry_price:
+                tick_buf = tick_size if (tick_size and tick_size > 0) else (entry_price * 0.0005)
+                candidate_wick_sl = trap_wick_price + tick_buf
+                # Only use wick SL if it is tighter than or equal to max margin loss
+                if candidate_wick_sl < sl_price:
+                    sl_price = candidate_wick_sl
             if tick_size and tick_size > 0:
                 sl_price = round_to_tick(sl_price, tick_size, direction='UP')
             
@@ -293,6 +309,79 @@ class RiskManager:
             else:
                 return current_sl, False, f"Candidate SL ${candidate_sl:,.2f} >= current SL ${current_sl:,.2f}"
 
+    def calculate_structural_trailing_stop_loss(
+        self,
+        entry_price: float,
+        side: str,
+        current_price: float,
+        current_sl: float,
+        candles_1m: List[Any],
+        tick_size: Optional[float] = None,
+        buffer_atr: float = 0.0,
+    ) -> Tuple[float, bool, str]:
+        """Calculate Structural Swing Trailing Stop Loss.
+        
+        Trails behind confirmed 1m swing points:
+        - LONG: Trails behind the most recent 1m swing low.
+          Ratchets upward only when swing low (minus buffer) > current_sl.
+        - SHORT: Trails behind the most recent 1m swing high.
+          Ratchets downward only when swing high (plus buffer) < current_sl (or current_sl <= 0).
+          
+        Returns: (new_sl_price, updated: bool, reason: str)
+        """
+        if not candles_1m or len(candles_1m) < 5:
+            return current_sl, False, "Insufficient 1m candles for structural trailing stop"
+
+        is_long = side.upper() in ('LONG', 'BUY')
+        
+        # Extract low and high arrays
+        if isinstance(candles_1m[0], dict):
+            highs = [float(c['high']) for c in candles_1m]
+            lows = [float(c['low']) for c in candles_1m]
+        else:
+            highs = [float(c.high) for c in candles_1m]
+            lows = [float(c.low) for c in candles_1m]
+
+        n = len(candles_1m)
+        scan_len = min(15, n - 1)
+        sub_highs = highs[-scan_len - 1 : -1]
+        sub_lows = lows[-scan_len - 1 : -1]
+
+        if is_long:
+            swing_low_val = None
+            for idx in range(len(sub_lows) - 2, 0, -1):
+                if sub_lows[idx] <= sub_lows[idx - 1] and sub_lows[idx] <= sub_lows[idx + 1]:
+                    swing_low_val = sub_lows[idx]
+                    break
+            if swing_low_val is None:
+                swing_low_val = min(sub_lows[-3:])
+
+            candidate_sl = swing_low_val - buffer_atr
+            if tick_size and tick_size > 0:
+                candidate_sl = round_to_tick(candidate_sl, tick_size, direction='DOWN')
+
+            if candidate_sl > current_sl and candidate_sl < current_price:
+                return candidate_sl, True, f"Structural Trailing SL ratcheted to 1m swing low ${candidate_sl:,.2f}"
+            else:
+                return current_sl, False, f"Structural candidate SL ${candidate_sl:,.2f} <= current SL ${current_sl:,.2f}"
+        else:
+            swing_high_val = None
+            for idx in range(len(sub_highs) - 2, 0, -1):
+                if sub_highs[idx] >= sub_highs[idx - 1] and sub_highs[idx] >= sub_highs[idx + 1]:
+                    swing_high_val = sub_highs[idx]
+                    break
+            if swing_high_val is None:
+                swing_high_val = max(sub_highs[-3:])
+
+            candidate_sl = swing_high_val + buffer_atr
+            if tick_size and tick_size > 0:
+                candidate_sl = round_to_tick(candidate_sl, tick_size, direction='UP')
+
+            if (candidate_sl < current_sl or current_sl <= 0) and candidate_sl > current_price:
+                return candidate_sl, True, f"Structural Trailing SL ratcheted to 1m swing high ${candidate_sl:,.2f}"
+            else:
+                return current_sl, False, f"Structural candidate SL ${candidate_sl:,.2f} >= current SL ${current_sl:,.2f}"
+
     def calculate_position_size(self, equity: float, price: float, leverage: int, contract_value: float) -> Tuple[int, float, float]:
         allocatable = equity * self.config.capital.max_allocation_pct
         margin = allocatable
@@ -310,8 +399,12 @@ class RiskManager:
                         contract_value: float = 1.0, size: int = 1, atr: float = 100.0,
                         tick_size: Optional[float] = None,
                         structural_target: Optional[float] = None,
-                        setup_type: Optional[str] = None) -> Tuple[float, float]:
-        sl_price, _, _ = self.calculate_stop_loss(entry_price, side, margin, leverage, contract_value, size, atr, tick_size=tick_size)
+                        setup_type: Optional[str] = None,
+                        trap_wick_price: Optional[float] = None) -> Tuple[float, float]:
+        sl_price, _, _ = self.calculate_stop_loss(
+            entry_price, side, margin, leverage, contract_value, size, atr, 
+            tick_size=tick_size, trap_wick_price=trap_wick_price
+        )
         tp_price = self.calculate_take_profit(
             entry_price, side, margin, leverage, contract_value, size, 
             tick_size=tick_size, structural_target=structural_target, sl_price=sl_price,

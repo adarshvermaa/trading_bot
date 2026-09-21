@@ -34,6 +34,7 @@ class ActiveOrder:
     created_at: float = 0.0
     initial_sl: Optional[float] = None
     setup_type: str = "NONE"
+    execution_routing: str = "MARKET_MOMENTUM"
 
     def __post_init__(self):
         if self.created_at == 0.0:
@@ -233,7 +234,7 @@ class OrderManager:
         # Step 5: Liquidation distance
         liquidation_distance = price / leverage
 
-        # Step 6: Calculate SL/TP with tick_size rounding and optional structural target
+        # Step 6: Calculate SL/TP with tick_size rounding, optional structural target, and sniper trap wick
         calc_sl, calc_tp = self.risk_manager.calculate_sl_tp(
             side=side,
             entry_price=price,
@@ -245,6 +246,7 @@ class OrderManager:
             tick_size=tick_size,
             structural_target=structural_target_tp,
             setup_type=setup_type,
+            trap_wick_price=kwargs.get("trap_wick_price", None),
         )
         final_sl = round_to_tick(sl_price if sl_price is not None else calc_sl, tick_size)
         final_tp = round_to_tick(tp_price if tp_price is not None else calc_tp, tick_size)
@@ -276,7 +278,11 @@ class OrderManager:
             logger.error(f"Trade rejected by RiskManager: {reason}")
             return None
 
-        # Force market order only on Delta Exchange - limit orders are removed
+        # Smart Execution Routing: LIMIT_PULLBACK (Maker fee efficiency) vs MARKET_MOMENTUM (Breakouts)
+        if setup_type in ("ORDER_BLOCK_PULLBACK", "FVG_RETEST", "TREND_PULLBACK"):
+            execution_routing = "LIMIT_PULLBACK"
+        else:
+            execution_routing = "MARKET_MOMENTUM"
         chosen_order_type = "market_order"
 
         # Log details
@@ -327,6 +333,7 @@ class OrderManager:
                     created_at=time.time(),
                     initial_sl=final_sl,
                     setup_type=setup_type,
+                    execution_routing=execution_routing,
                 )
                 self.active_orders[order_id] = active_order
 
@@ -690,6 +697,7 @@ class OrderManager:
                 "fill_price": f"${ao.entry_price:,.2f}" if ao.entry_price else "--",
                 "fees": "--",
                 "last_event": getattr(ao, "last_event", "--") or "--",
+                "execution_routing": getattr(ao, "execution_routing", "MARKET_MOMENTUM"),
             }
         elif self.last_closed_order:
             pnl_val = self.last_closed_order.get("pnl", 0.0)
@@ -709,6 +717,7 @@ class OrderManager:
                 "fill_price": fill_desc,
                 "fees": "--",
                 "last_event": f"{reason} ({pnl_str})",
+                "execution_routing": "HYBRID_OPTIMIZED",
             }
         else:
             return {
@@ -717,6 +726,7 @@ class OrderManager:
                 "fill_price": "--",
                 "fees": "--",
                 "last_event": "WAITING_FOR_SETUP",
+                "execution_routing": "HYBRID_OPTIMIZED",
             }
 
 
