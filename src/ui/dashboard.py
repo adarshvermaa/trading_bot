@@ -341,6 +341,12 @@ class Dashboard:
         table.add_row("Pattern Memory", Text(f": {self.signal_data.get('pattern_memory_stats', 'W: 0 | L: 0')}", style="bold green"))
         table.add_row("Pattern Audit", Text(f": {self.signal_data.get('last_pattern_audit', 'Neutral')}", style="cyan"))
         table.add_row("LLM Status", f": {self.signal_data.get('llm_status', 'Disabled')}")
+        jev_status = self.signal_data.get('jev_status', 'DISABLED')
+        jev_col = "bold magenta" if "ACTIVE" in jev_status else "dim"
+        table.add_row("Jev AI (Sys1)", Text(f": {jev_status}", style=jev_col))
+        jev_vrd = self.signal_data.get('jev_verdict', '--')
+        vrd_col = "bold green" if "BOOST" in jev_vrd else ("bold red" if "VETO" in jev_vrd else "cyan")
+        table.add_row("Jev Verdict", Text(f": {jev_vrd}", style=vrd_col))
         table.add_row("Score", f": {self.signal_data.get('signal_score', '--')}")
 
         setup_t = self.signal_data.get('setup_type', 'NONE')

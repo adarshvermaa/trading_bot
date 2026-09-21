@@ -110,6 +110,17 @@ class BreakoutConfig(BaseModel):
     breakeven_r_mult: float = 2.0
 
 
+class JevConfig(BaseModel):
+    enabled: bool = True
+    model: str = "jev-latest"
+    timeout_ms: int = 1200
+    min_confidence: float = 0.70
+    max_trap_probability: float = 0.35
+    min_setup_grade: float = 2.5
+    enable_active_monitoring: bool = True
+    enable_mistake_forensics: bool = True
+
+
 class StrategyConfig(BaseModel):
     assets: AssetConfig = Field(default_factory=AssetConfig)
     timeframes: list[str] = Field(default_factory=lambda: ["15m", "5m", "1m"])
@@ -120,6 +131,7 @@ class StrategyConfig(BaseModel):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     session: SessionConfig = Field(default_factory=SessionConfig)
     breakout: BreakoutConfig = Field(default_factory=BreakoutConfig)
+    jev: JevConfig = Field(default_factory=JevConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +215,7 @@ class EnvConfig(BaseModel):
     delta_ws_url: str = "wss://socket.india.delta.exchange"
     litellm_api_key: str = ""
     litellm_model: str = "gpt-4o-mini"
+    jev_api_key: str = ""
     live_trading: bool = False
     log_level: str = "INFO"
     log_dir: str = "logs"
@@ -245,6 +258,7 @@ def load_config(config_dir: pathlib.Path | str | None = None) -> AppConfig:
         delta_ws_url=os.getenv("DELTA_WS_URL", "wss://socket.india.delta.exchange"),
         litellm_api_key=os.getenv("LITELLM_API_KEY", ""),
         litellm_model=os.getenv("LITELLM_MODEL", "gpt-4o-mini"),
+        jev_api_key=os.getenv("JEV_LLM", os.getenv("TYPESAFE_API_KEY", "")),
         live_trading=os.getenv("LIVE_TRADING", "false"),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         log_dir=os.getenv("LOG_DIR", "logs"),

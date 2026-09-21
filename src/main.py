@@ -28,6 +28,7 @@ from src.strategy.regime import RegimeFilter, evaluate_session, SessionKillZone
 from src.ml.onnx_model import ONNXScalperModel
 from src.ml.pattern_memory import PatternMemoryStore, MarketPatternFingerprint
 from src.llm.advisor import LLMAdvisor
+from src.llm.jev_client import JevClient, JevPreTradeAudit, JevActiveTradeAudit, JevMistakeForensics
 from src.risk.risk_manager import RiskManager
 from src.portfolio.account import AccountManager
 from src.ui.dashboard import Dashboard
@@ -86,6 +87,12 @@ class ScalpingBot:
             model=config.env.litellm_model,
         )
 
+        # ---- Jev AI (System One) layer ----
+        self.jev_client = JevClient(
+            api_key=config.env.jev_api_key,
+            config=config.strategy.jev,
+        )
+
         # ---- Risk layer ----
         self.risk_manager = RiskManager(config.risk)
 
@@ -102,6 +109,7 @@ class ScalpingBot:
             config=config,
             account_manager=self.account_manager,
             pattern_memory=self.pattern_memory,
+            jev_client=self.jev_client,
         )
 
         # ---- UI layer ----
@@ -118,6 +126,7 @@ class ScalpingBot:
         self._nearest_resistance: float = 0.0
         self._last_close_reason: str = ""
         self._last_pattern_audit: str = "NEUTRAL"
+        self._last_jev_verdict: str = "--"
         self._re_entry_cooldown_until: float = 0.0
         self._asset_rankings: list[dict[str, Any]] = []
         self._market_watch: dict[str, Any] = {"assets": {}}
@@ -133,6 +142,8 @@ class ScalpingBot:
             "volume": "--",
             "onnx_confidence": "--",
             "llm_status": self.llm_advisor.get_status(),
+            "jev_status": self.jev_client.get_status(),
+            "jev_verdict": "--",
             "signal_score": "WARMING UP",
             "next_trigger": "Pre-seeding candles from Delta Exchange...",
         }
@@ -434,6 +445,48 @@ class ScalpingBot:
                             self._re_entry_cooldown_until = time.time() + 10.0
                             continue
 
+                        # Jev AI active trade health check (System One)
+                        if (
+                            self.config.strategy.jev.enabled
+                            and self.config.strategy.jev.enable_active_monitoring
+                            and self.jev_client.enabled
+                        ):
+                            pos_entry = self.account_manager.positions.get(symbol) if self.account_manager else None
+                            pos_pnl = pos_entry.unrealized_pnl if pos_entry else 0.0
+                            vwap_dist = ((live_price - self._nearest_support) / live_price) if (live_price > 0 and self._nearest_support > 0) else 0.0
+
+                            jev_active = await self.jev_client.evaluate_active_trade(
+                                symbol=symbol,
+                                side=active.side,
+                                entry_price=active.entry_price,
+                                current_price=live_price,
+                                pnl=pos_pnl,
+                                duration_seconds=time.time() - getattr(active, "created_at", time.time()),
+                                rsi=50.0,
+                                vwap_dist_pct=vwap_dist,
+                                structure_health_notes=reason,
+                            )
+                            if jev_active and (
+                                jev_active.should_exit_early >= 0.80
+                                or (jev_active.momentum_state == "REVERSAL" and jev_active.momentum_confidence >= 0.85)
+                            ):
+                                logger.warning(
+                                    f"[JEV ACTIVE EXIT] Triggering emergency early exit for {symbol} {active.side}: "
+                                    f"state={jev_active.momentum_state} (exit_prob={jev_active.should_exit_early:.2f})"
+                                )
+                                product = await self.delta_client.get_product(symbol)
+                                cv = float(product.get("contract_value", 1.0)) if product else 1.0
+                                pnl = await self.order_manager.close_and_record(
+                                    reason=f"JEV_ACTIVE_EXIT: {jev_active.momentum_state}",
+                                    close_price=live_price,
+                                    contract_value=cv,
+                                )
+                                self.order_manager.clear_closed_orders()
+                                self._last_close_reason = "JEV_ACTIVE_EXIT"
+                                self._position_health = "--"
+                                self._re_entry_cooldown_until = time.time() + 10.0
+                                continue
+
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -570,9 +623,7 @@ class ScalpingBot:
                     f"Pattern Memory VETO for {symbol} {sig.direction}: {pattern_audit.reason}"
                 )
                 self._last_pattern_audit = f"VETO ({pattern_audit.matched_loss_trade_id})"
-                continue
-
-            if pattern_audit.is_boosted:
+            elif pattern_audit.is_boosted:
                 logger.info(
                     f"Pattern Memory BOOST for {symbol} {sig.direction}: {pattern_audit.reason}"
                 )
@@ -601,8 +652,50 @@ class ScalpingBot:
                 + weights.ml_confidence * ml_confidence
             )
 
+            # Jev AI (System One) Confluence & Trap Gatekeeper
+            jev_audit = None
+            if (
+                self.config.strategy.jev.enabled
+                and self.jev_client.enabled
+                and structure.is_valid
+                and sig.direction in ("LONG", "SHORT")
+                and not pattern_audit.is_blocked
+            ):
+                jev_indicators = {
+                    "rsi": sig.rsi,
+                    "adx": current_adx,
+                    "relative_volume": sig.relative_volume,
+                    "vwap_position": getattr(sig, "vwap_position", "NEUTRAL"),
+                    "atr": current_atr,
+                }
+                jev_audit = await self.jev_client.evaluate_pre_trade_setup(
+                    symbol=symbol,
+                    direction=sig.direction,
+                    indicators=jev_indicators,
+                    structure=structure,
+                    fingerprint=fingerprint,
+                    session_info=session_info,
+                )
+                if jev_audit:
+                    if jev_audit.is_vetoed:
+                        logger.warning(
+                            f"[JEV VETO] {symbol} {sig.direction} rejected: {jev_audit.veto_reason}"
+                        )
+                        self._last_jev_verdict = f"VETO ({jev_audit.veto_reason[:20]})"
+                    elif jev_audit.is_boosted:
+                        score += jev_audit.boost_amount
+                        self._last_jev_verdict = f"BOOST (+{jev_audit.boost_amount:.2f}, Grd={jev_audit.setup_grade:.1f})"
+                    else:
+                        self._last_jev_verdict = f"PASS (Grd={jev_audit.setup_grade:.1f})"
+
             score_hurdle = 0.70 if session_info.is_dead_zone else 0.55
-            is_actionable = structure.is_valid and sig.direction in ("LONG", "SHORT") and (ml_confirmed or score >= score_hurdle)
+            is_actionable = (
+                structure.is_valid
+                and sig.direction in ("LONG", "SHORT")
+                and not pattern_audit.is_blocked
+                and not (jev_audit and jev_audit.is_vetoed)
+                and (ml_confirmed or score >= score_hurdle)
+            )
 
             evaluations.append({
                 "symbol": symbol,
@@ -700,6 +793,8 @@ class ScalpingBot:
             "pattern_memory_stats": f"W:{len(self.pattern_memory.winning_patterns)} | L:{len(self.pattern_memory.losing_patterns)}",
             "last_pattern_audit": self._last_pattern_audit,
             "llm_status": self.llm_advisor.get_status(),
+            "jev_status": self.jev_client.get_status(),
+            "jev_verdict": self._last_jev_verdict,
             "signal_score": f"ACTIONABLE ({top['score']:.3f})" if top["is_actionable"] else f"RANK #{1} {top['symbol']} ({top['score']:.2f})",
             "next_trigger": next_trigger,
             "setup_type": getattr(top["structure"], "setup_type", "NONE"),
@@ -824,6 +919,8 @@ class ScalpingBot:
                                     "volume": f"{sig.relative_volume:.2f}x",
                                     "onnx_confidence": self._monitored_market.get("onnx_confidence", "--"),
                                     "llm_status": self.llm_advisor.get_status(),
+                                    "jev_status": self.jev_client.get_status(),
+                                    "jev_verdict": self._last_jev_verdict,
                                     "signal_score": f"MONITORING ({self._position_health})",
                                 }
 
@@ -1197,6 +1294,10 @@ class ScalpingBot:
             pass
         try:
             await self.delta_client.close()
+        except Exception:
+            pass
+        try:
+            await self.jev_client.close()
         except Exception:
             pass
 

@@ -51,12 +51,14 @@ class OrderManager:
         config: Any,
         account_manager: Optional[Any] = None,
         pattern_memory: Optional[Any] = None,
+        jev_client: Optional[Any] = None,
     ):
         self.delta_client = delta_client
         self.risk_manager = risk_manager
         self.config = config
         self.account_manager = account_manager
         self.pattern_memory = pattern_memory
+        self.jev_client = jev_client
         self.active_orders: Dict[str, ActiveOrder] = {}
         self.active_client_ids: set[str] = set()
         self.last_closed_order: Optional[Dict[str, Any]] = None
@@ -471,6 +473,20 @@ class OrderManager:
             except Exception as e:
                 logger.error(f"Failed to record trade result in pattern memory: {e}")
 
+            # Jev AI Mistake Forensics (Async background diagnosis for losses)
+            if pnl < 0 and self.jev_client and getattr(self.jev_client, "enabled", False):
+                asyncio.create_task(
+                    self._run_jev_forensics(
+                        symbol=symbol,
+                        side=target.side,
+                        entry_p=target.entry_price,
+                        exit_p=close_price,
+                        pnl=pnl,
+                        close_reason=reason,
+                        fingerprint=target.entry_fingerprint,
+                    )
+                )
+
         # Update order state
         pnl_str = f"+${pnl:,.2f}" if pnl >= 0 else f"-${abs(pnl):,.2f}"
         target.state = OrderState.CLOSED
@@ -745,5 +761,42 @@ class OrderManager:
                 "last_event": "WAITING_FOR_SETUP",
                 "execution_routing": "HYBRID_OPTIMIZED",
             }
+
+    async def _run_jev_forensics(
+        self,
+        symbol: str,
+        side: str,
+        entry_p: float,
+        exit_p: float,
+        pnl: float,
+        close_reason: str,
+        fingerprint: Any,
+    ) -> None:
+        """Asynchronously diagnose stopped-out trade with Jev AI and update pattern memory."""
+        try:
+            forensics = await self.jev_client.diagnose_stopped_out_trade(
+                symbol=symbol,
+                side=side,
+                entry_price=entry_p,
+                exit_price=exit_p,
+                pnl=pnl,
+                close_reason=close_reason,
+            )
+            if forensics and self.pattern_memory:
+                classified_reason = f"{forensics.root_cause} (prev={forensics.was_preventable:.2f}, {close_reason})"
+                fingerprint.close_reason = classified_reason
+                # Update in-memory and disk losing patterns with AI classification
+                if hasattr(self.pattern_memory, "losing_patterns"):
+                    for lp in reversed(self.pattern_memory.losing_patterns):
+                        if getattr(lp, "trade_id", None) == getattr(fingerprint, "trade_id", None):
+                            lp.close_reason = classified_reason
+                            break
+                    self.pattern_memory._save_patterns(
+                        self.pattern_memory.losing_file, self.pattern_memory.losing_patterns
+                    )
+                logger.info(f"Pattern memory updated with Jev forensics: {classified_reason}")
+        except Exception as e:
+            logger.debug(f"Error executing Jev forensics: {e}")
+
 
 

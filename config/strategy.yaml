@@ -64,3 +64,14 @@ breakout:
   runner_mode_enabled: true         # Enable trend runner mode (exempt from 29m limit in trending regime)
   breakeven_r_mult: 2.0             # Move stop loss to breakeven (+0.1%) when profit >= 2.0R
 
+jev:
+  enabled: true                     # Enable TypeSafe Jev System One decision model
+  model: "jev-latest"               # Model name (jev-latest or jev-1.13.0)
+  timeout_ms: 1200                  # Max network timeout before local ONNX fallback
+  min_confidence: 0.70              # Minimum directional confidence (0.0 to 1.0)
+  max_trap_probability: 0.35        # Maximum allowed bull/bear trap probability (noul < 0.35)
+  min_setup_grade: 2.5              # Minimum institutional setup grade (0.0 to 4.0)
+  enable_active_monitoring: true    # Enable dynamic trade health & momentum evaluation
+  enable_mistake_forensics: true    # Diagnose stopped-out trades and log to patterns.db
+
+
