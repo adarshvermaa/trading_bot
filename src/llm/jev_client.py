@@ -68,6 +68,10 @@ class JevPreTradeAudit:
     boost_amount: float
     latency_ms: float
 
+    @property
+    def trap_probability(self) -> float:
+        return self.is_trap
+
 
 @dataclass
 class JevActiveTradeAudit:
@@ -283,6 +287,7 @@ class JevClient:
         structure: Any,
         fingerprint: Any,
         session_info: Any = None,
+        pattern_memory_audit: Any = None,
     ) -> Optional[JevPreTradeAudit]:
         """
         Evaluate candidate setup against Jev System One model before order placement.
@@ -317,13 +322,39 @@ class JevClient:
         spread_bps = _safe_float(getattr(fingerprint, "spread_bps", 0.8), 0.8)
         session_zone = getattr(getattr(session_info, "zone", None), "value", "NORMAL") if session_info else "NORMAL"
 
+        chart_pattern = getattr(structure, "chart_pattern", "NONE")
+        pricing_zone = getattr(structure, "pricing_zone", "EQUILIBRIUM")
+        range_pos = _safe_float(getattr(structure, "range_position_pct", 50.0), 50.0)
+        playbook = getattr(structure, "playbook", "NONE")
+        eqh = _safe_float(getattr(structure, "eqh", 0.0), 0.0)
+        eql = _safe_float(getattr(structure, "eql", 0.0), 0.0)
+        fvg_detected = getattr(structure, "fvg_detected", False)
+        fvg_dir = getattr(structure, "fvg_direction", "NONE")
+        ob_detected = getattr(structure, "ob_detected", False)
+        ob_dir = getattr(structure, "ob_direction", "NONE")
+
+        matched_loss_trade_id = getattr(pattern_memory_audit, "matched_loss_trade_id", None)
+        matched_loss_sim = _safe_float(getattr(pattern_memory_audit, "matched_loss_similarity", 0.0), 0.0)
+        matched_loss_reason = getattr(pattern_memory_audit, "matched_loss_reason", None)
+        matched_win_trade_id = getattr(pattern_memory_audit, "matched_win_trade_id", None)
+        matched_win_sim = _safe_float(getattr(pattern_memory_audit, "matched_win_similarity", 0.0), 0.0)
+
+        pat_memory_str = "Neutral (No prior pattern match)"
+        if matched_loss_trade_id and matched_loss_sim >= 0.70:
+            pat_memory_str = f"Historical Loss Match {matched_loss_trade_id} ({matched_loss_sim*100:.1f}%, Reason: '{matched_loss_reason}')"
+        elif matched_win_trade_id and matched_win_sim >= 0.70:
+            pat_memory_str = f"Historical Win Match {matched_win_trade_id} ({matched_win_sim*100:.1f}%)"
+
         state = (
             f"Symbol: {symbol}, Scalping Timeframes: 15m/5m/1m. "
             f"Candidate Entry Direction: {direction}. "
             f"Momentum & Trend: RSI={rsi:.1f}, ADX={adx:.1f}, Relative Volume={rel_vol:.2f}x, VWAP={vwap_pos}, ATR={atr:.2f}. "
-            f"ICT Structure: 15m Bias={bias_15m}, 5m BOS={bos_5m}, 5m CHoCH={choch_5m}, 1m Displacement={disp_1m}, 1m Retest={retest_1m}. "
-            f"Liquidity & Traps: 5m Sweep={sweep_5m}, Bull Trap={is_bull_trap}, Bear Trap={is_bear_trap}, Judas Swing={is_judas}. "
-            f"Execution Environment: Bid-Ask Spread={spread_bps:.1f} bps, Market Session={session_zone}."
+            f"TradingView Chart Pattern: Pattern={chart_pattern}, Playbook={playbook}, Dealing Range Zone={pricing_zone} ({range_pos:.1f}%). "
+            f"ICT Key Levels: 15m Bias={bias_15m}, 5m BOS={bos_5m}, 5m CHoCH={choch_5m}, 1m Displacement={disp_1m}, 1m Retest={retest_1m}. "
+            f"Liquidity Pools & FVG: EQH=${eqh:.1f}, EQL=${eql:.1f}, FVG={fvg_dir} ({fvg_detected}), OB={ob_dir} ({ob_detected}). "
+            f"Liquidity Sweeps & Traps: 5m Sweep={sweep_5m}, Bull Trap={is_bull_trap}, Bear Trap={is_bear_trap}, Judas Swing={is_judas}. "
+            f"Execution Environment: Bid-Ask Spread={spread_bps:.1f} bps, Market Session={session_zone}. "
+            f"Historical Pattern Memory Context: {pat_memory_str}."
         )
 
         questions = {
@@ -362,6 +393,15 @@ class JevClient:
             },
         }
 
+        if matched_loss_trade_id and matched_loss_sim >= 0.75:
+            questions["past_mistake_risk"] = {
+                "type": "noul",
+                "instructions": (
+                    f"This setup has {matched_loss_sim*100:.0f}% mathematical similarity to past failed trade {matched_loss_trade_id} "
+                    f"which closed on '{matched_loss_reason}'. Does the current market condition suffer from that exact same failure mode?"
+                ),
+            }
+
         answers = await self._query_system_one(state, questions)
         if not answers:
             return None
@@ -385,20 +425,29 @@ class JevClient:
         cost_ans = answers.get("cost_headwind", {})
         cost_headwind = float(cost_ans.get("noul", 0.0))
 
+        # 5. Parse past_mistake_risk if applicable (Noul)
+        past_mistake_ans = answers.get("past_mistake_risk", {})
+        past_mistake_risk = float(past_mistake_ans.get("noul", 0.0))
+
         # --- Gating & Decision Logic ---
         is_vetoed = False
         veto_reason = ""
         is_boosted = False
         boost_amount = 0.0
 
-        # Rule A: Trap Probability VETO
-        if is_trap_val >= self.config.max_trap_probability:
+        # Rule A: Past Mistake Repeat Risk VETO (Jev Cognitive Arbiter)
+        if past_mistake_risk >= 0.70:
+            is_vetoed = True
+            veto_reason = f"Pattern Trap: Jev confirms high risk ({past_mistake_risk*100:.0f}%) of repeating past loss {matched_loss_trade_id}"
+
+        # Rule B: Trap Probability VETO
+        elif is_trap_val >= self.config.max_trap_probability:
             is_vetoed = True
             veto_reason = (
                 f"Trap risk too high: {is_trap_val:.2f} >= max {self.config.max_trap_probability:.2f}"
             )
 
-        # Rule B: Direction Conflict VETO
+        # Rule C: Direction Conflict VETO
         elif direction_bias != direction and direction_bias != "NEUTRAL" and dir_conf >= self.config.min_confidence:
             is_vetoed = True
             veto_reason = (
@@ -406,19 +455,19 @@ class JevClient:
                 f"({dir_conf*100:.0f}% confidence)"
             )
 
-        # Rule C: Cost Headwind VETO
+        # Rule D: Cost Headwind VETO
         elif cost_headwind >= 0.70:
             is_vetoed = True
             veto_reason = (
                 f"Cost friction headwind too high: spread/fee friction prob={cost_headwind:.2f}"
             )
 
-        # Rule D: Setup Grade VETO (if setup is graded F or low D < 1.5)
+        # Rule E: Setup Grade VETO (if setup is graded F or low D < 1.5)
         elif setup_grade < 1.5:
             is_vetoed = True
             veto_reason = f"Poor setup quality: grade {setup_grade:.2f}/4.0 < minimum 1.5"
 
-        # Rule E: Confluence Quality BOOST
+        # Rule F: Confluence Quality BOOST
         elif (
             direction_bias == direction
             and dir_conf >= self.config.min_confidence
@@ -655,6 +704,11 @@ class JevClient:
         val = technical_levels.get("val")
         pdh = technical_levels.get("pdh")
         pdl = technical_levels.get("pdl")
+        eqh = technical_levels.get("eqh")
+        eql = technical_levels.get("eql")
+        fvg_top = technical_levels.get("fvg_top")
+        fvg_bottom = technical_levels.get("fvg_bottom")
+        chart_target = technical_levels.get("chart_pattern_target")
         nearest_res = technical_levels.get("nearest_resistance")
         nearest_sup = technical_levels.get("nearest_support")
 
@@ -670,6 +724,7 @@ class JevClient:
             f"Liquidity Sweep Wick: {_fmt(trap_wick_price)}. "
             f"Value Area: VAH={_fmt(vah)}, VAL={_fmt(val)}. "
             f"HTF Levels: PDH={_fmt(pdh)}, PDL={_fmt(pdl)}. "
+            f"Liquidity Pools & FVG: EQH={_fmt(eqh)}, EQL={_fmt(eql)}, FVG Target={_fmt(fvg_top if is_long else fvg_bottom)}, Chart Target={_fmt(chart_target)}. "
             f"Nearest Levels: Support={_fmt(nearest_sup)}, Resistance={_fmt(nearest_res)}."
         )
 
@@ -699,20 +754,22 @@ class JevClient:
                 "type": "choice",
                 "instructions": "What is the primary high-probability Take Profit target level?",
                 "criteria": {
-                    "LIQUIDITY_POOL": "Target the opposing liquidity pool or session extreme sweep",
+                    "OPPOSING_LIQUIDITY": "Target opposing Buy-Side/Sell-Side Liquidity pool (EQH/EQL, PDH/PDL)",
+                    "UNMITIGATED_FVG": "Target unmitigated Fair Value Gap fill in direction of bias",
+                    "LIQUIDITY_POOL": "Target nearest structural resistance/support liquidity pool",
                     "VALUE_AREA_EXTREME": "Target the Value Area High / Low range extreme",
                     "MEASURED_EXTENSION": "Target standard expansion extension based on risk multiple",
                 },
             },
             "target_rr_multiple": {
                 "type": "score",
-                "instructions": "Rate the institutional reward expansion potential in terms of R-multiple (2.0R to 5.0R)",
+                "instructions": "Rate institutional reward expansion potential (2.5R to 5.0R)",
                 "criteria": [
-                    "2.0R: Conservative scalp target into initial resistance/support",
-                    "2.5R: Standard high-probability ICT expansion target",
-                    "3.0R: Strong momentum trend continuation target",
-                    "4.0R: Multi-timeframe breakout extension",
-                    "5.0R: Major institutional runner",
+                    "2.5R: Standard high-probability institutional ICT expansion target",
+                    "3.0R: Strong momentum trend continuation target into liquidity pool",
+                    "3.5R: Multi-timeframe breakout extension",
+                    "4.0R: Major unmitigated FVG / liquidity void target",
+                    "5.0R: Multi-session institutional runner",
                 ],
             },
         }
@@ -730,18 +787,18 @@ class JevClient:
         cushion_score = float(cushion_ans.get("score", 2.0))
 
         tp_ans = answers.get("tp_target_type", {})
-        tp_target_type = str(tp_ans.get("choice", "LIQUIDITY_POOL")).upper()
+        tp_target_type = str(tp_ans.get("choice", "OPPOSING_LIQUIDITY")).upper()
 
         rr_ans = answers.get("target_rr_multiple", {})
-        rr_score = float(rr_ans.get("score", 1.0))  # default 1.0 -> 2.5R
+        rr_score = float(rr_ans.get("score", 1.0))  # default 1.0 -> 3.0R
 
         # Map cushion score to ATR multiplier (0.1x to 0.8x ATR)
         cushion_mult = 0.10 + (cushion_score / 4.0) * 0.70
         cushion = cushion_mult * atr_val
 
-        # Map target R-multiple score (maps 0.0 -> 2.0R, 4.0 -> 5.0R)
-        min_rr = getattr(self.config, "min_risk_reward_ratio", 2.0)
-        target_rr = max(min_rr, 2.0 + (rr_score / 4.0) * 3.0)
+        # Map target R-multiple score (maps 0.0 -> 2.5R, 4.0 -> 5.0R)
+        min_rr = getattr(self.config, "min_risk_reward_ratio", 2.5)
+        target_rr = max(min_rr, 2.5 + (rr_score / 4.0) * 2.5)
 
         # Compute raw SL
         if is_long:
@@ -764,10 +821,13 @@ class JevClient:
 
             # Compute raw TP
             structural_tp = None
-            if tp_target_type == "LIQUIDITY_POOL":
-                cand_res = nearest_res or pdh
+            if tp_target_type in ("OPPOSING_LIQUIDITY", "LIQUIDITY_POOL"):
+                cand_res = nearest_res or eqh or pdh or chart_target
                 if cand_res and cand_res > entry_price and (cand_res - entry_price) >= min_rr * risk:
                     structural_tp = cand_res
+            elif tp_target_type == "UNMITIGATED_FVG":
+                if fvg_top and fvg_top > entry_price and (fvg_top - entry_price) >= min_rr * risk:
+                    structural_tp = fvg_top
             elif tp_target_type == "VALUE_AREA_EXTREME":
                 if vah and vah > entry_price and (vah - entry_price) >= min_rr * risk:
                     structural_tp = vah
@@ -806,10 +866,13 @@ class JevClient:
             risk = max(atr_val * 0.5, raw_sl - entry_price)
 
             structural_tp = None
-            if tp_target_type == "LIQUIDITY_POOL":
-                cand_sup = nearest_sup or pdl
+            if tp_target_type in ("OPPOSING_LIQUIDITY", "LIQUIDITY_POOL"):
+                cand_sup = nearest_sup or eql or pdl or chart_target
                 if cand_sup and 0 < cand_sup < entry_price and (entry_price - cand_sup) >= min_rr * risk:
                     structural_tp = cand_sup
+            elif tp_target_type == "UNMITIGATED_FVG":
+                if fvg_bottom and 0 < fvg_bottom < entry_price and (entry_price - fvg_bottom) >= min_rr * risk:
+                    structural_tp = fvg_bottom
             elif tp_target_type == "VALUE_AREA_EXTREME":
                 if val and 0 < val < entry_price and (entry_price - val) >= min_rr * risk:
                     structural_tp = val
@@ -946,9 +1009,9 @@ class JevClient:
 
         elif action == "LOCK_BREAKEVEN":
             if is_long:
-                candidate_sl = entry_price * 1.001
+                candidate_sl = entry_price + (0.1 * initial_risk)
             else:
-                candidate_sl = entry_price * 0.999
+                candidate_sl = entry_price - (0.1 * initial_risk)
 
         elif action == "TRAIL_RECENT_SWING":
             if is_long and new_swing_low and new_swing_low > 0:
@@ -963,6 +1026,23 @@ class JevClient:
                 candidate_sl = current_price - (0.5 * atr_val)
             else:
                 candidate_sl = current_price + (0.5 * atr_val)
+
+        # Institutional Breakeven & Runner Ratchet Guards:
+        # 1. At >= +1.2R profit: ratchet to at least Breakeven + 0.1R buffer (covers fees & slippage)
+        if r_profit >= 1.2:
+            be_sl = entry_price + (0.1 * initial_risk) if is_long else entry_price - (0.1 * initial_risk)
+            if is_long:
+                candidate_sl = max(candidate_sl, be_sl)
+            else:
+                candidate_sl = min(candidate_sl, be_sl)
+
+        # 2. At >= +2.0R profit: lock in at least +1.0R runner profit
+        if r_profit >= 2.0:
+            runner_sl = entry_price + (1.0 * initial_risk) if is_long else entry_price - (1.0 * initial_risk)
+            if is_long:
+                candidate_sl = max(candidate_sl, runner_sl)
+            else:
+                candidate_sl = min(candidate_sl, runner_sl)
 
         # Enforce Ratchet Invariant: Trailing SL can NEVER move backwards!
         if is_long:

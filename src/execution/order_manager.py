@@ -617,9 +617,21 @@ class OrderManager:
                 return target_order
 
             exchange_state = str(res.get("state") or "").lower()
-            if exchange_state == "filled":
-                raw_fill = res.get("average_fill_price") or res.get("fill_price")
-                fill_price = float(raw_fill) if (raw_fill and float(raw_fill) > 0) else target_order.entry_price
+            raw_unfilled = res.get("unfilled_size")
+            unfilled_sz = float(raw_unfilled) if (raw_unfilled is not None and str(raw_unfilled).strip() != "") else None
+            raw_fill = res.get("average_fill_price") or res.get("fill_price")
+            fill_price_val = float(raw_fill) if (raw_fill is not None and float(raw_fill) > 0) else None
+
+            # On Delta Exchange REST API v2, filled orders return state: 'closed' with unfilled_size: 0
+            is_filled = (exchange_state == "filled") or (
+                exchange_state == "closed" and (
+                    (unfilled_sz is not None and unfilled_sz == 0.0)
+                    or (fill_price_val is not None and fill_price_val > 0)
+                )
+            )
+
+            if is_filled:
+                fill_price = fill_price_val if fill_price_val is not None else target_order.entry_price
                 target_order.state = OrderState.FILLED
                 target_order.entry_price = fill_price
                 target_order.last_event = "ORDER_FILLED"
@@ -855,7 +867,7 @@ class OrderManager:
                     holding_time_sec=time.time() - getattr(fingerprint, "timestamp", time.time()),
                     exit_reason=close_reason,
                 )
-                if forensics and self.pattern_memory:
+                if forensics and self.pattern_memory and fingerprint is not None:
                     classified_reason = f"{forensics.root_cause} [{forensics.pattern_tag}] ({close_reason})"
                     fingerprint.close_reason = classified_reason
                     fingerprint.root_cause = forensics.root_cause

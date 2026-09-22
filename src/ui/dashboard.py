@@ -450,7 +450,9 @@ class Dashboard:
         table.add_row("Volume", f": {self.signal_data.get('volume', '--')}")
         table.add_row("ONNX Conf", f": {self.signal_data.get('onnx_confidence', '--')}")
         table.add_row("Pattern Mem", Text(f": {self.signal_data.get('pattern_memory_stats', 'W: 0 | L: 0')}", style="bold green"))
-        table.add_row("Pattern Audit", Text(f": {self.signal_data.get('last_pattern_audit', 'Neutral')}", style="cyan"))
+        audit_str = str(self.signal_data.get('last_pattern_audit', 'Neutral'))
+        audit_col = "bold yellow" if "ADVISORY" in audit_str else ("bold green" if "BOOST" in audit_str else ("bold red" if "VETO" in audit_str else "cyan"))
+        table.add_row("Pattern Audit", Text(f": {audit_str}", style=audit_col))
         
         # Jev AI System 1
         jev_status = self.signal_data.get('jev_status', 'DISABLED')
@@ -476,6 +478,17 @@ class Dashboard:
         setup_t = self.signal_data.get('setup_type', 'NONE')
         if setup_t and setup_t != "NONE":
             table.add_row("Scalp Setup", Text(f": {setup_t}", style="bold magenta"))
+
+        chart_pat = self.signal_data.get('chart_pattern', 'NONE')
+        pricing_z = self.signal_data.get('pricing_zone', 'EQUILIBRIUM')
+        if chart_pat and chart_pat != "NONE":
+            table.add_row("Chart Pattern", Text(f": {chart_pat} ({pricing_z})", style="bold yellow"))
+        elif pricing_z and pricing_z != "EQUILIBRIUM":
+            table.add_row("Dealing Zone", Text(f": {pricing_z}", style="bold cyan"))
+
+        playbook = self.signal_data.get('playbook', 'NONE')
+        if playbook and playbook != "NONE":
+            table.add_row("Playbook", Text(f": {playbook}", style="bold magenta"))
 
         pat = self.signal_data.get('pattern', 'NONE')
         if pat and pat != "NONE":

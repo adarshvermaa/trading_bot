@@ -470,7 +470,24 @@ class ScalpingBot:
                         ):
                             pos_entry = self.account_manager.positions.get(symbol) if self.account_manager else None
                             pos_pnl = pos_entry.unrealized_pnl if pos_entry else 0.0
-                            vwap_dist = ((live_price - self._nearest_support) / live_price) if (live_price > 0 and self._nearest_support > 0) else 0.0
+
+                            # Real-time technical metrics for position health
+                            c_1m = self.delta_ws.candle_store.get_candles(symbol, "1m")
+                            cur_rsi = 50.0
+                            vwap_dist = 0.0
+                            if len(c_1m) >= 15:
+                                import numpy as np
+                                closes = np.array([c.close for c in c_1m])
+                                highs = np.array([c.high for c in c_1m])
+                                lows = np.array([c.low for c in c_1m])
+                                volumes = np.array([c.volume for c in c_1m])
+                                vwap_arr = SignalGenerator.calculate_vwap(highs, lows, closes, volumes)
+                                if len(vwap_arr) > 0 and vwap_arr[-1] > 0:
+                                    cur_vwap = float(vwap_arr[-1])
+                                    vwap_dist = (live_price - cur_vwap) / cur_vwap
+                                rsi_arr = SignalGenerator.calculate_rsi(closes, period=14)
+                                if len(rsi_arr) > 0:
+                                    cur_rsi = float(rsi_arr[-1])
 
                             jev_active = await self.jev_client.evaluate_active_trade(
                                 symbol=symbol,
@@ -479,7 +496,7 @@ class ScalpingBot:
                                 current_price=live_price,
                                 pnl=pos_pnl,
                                 duration_seconds=time.time() - getattr(active, "created_at", time.time()),
-                                rsi=50.0,
+                                rsi=cur_rsi,
                                 vwap_dist_pct=vwap_dist,
                                 structure_health_notes=reason,
                             )
@@ -561,6 +578,36 @@ class ScalpingBot:
             }
 
         from src.strategy.signals import compute_atr, compute_adx, compute_vwap
+
+        # Periodic Jev System One Market Regime Arbiter (every 15 min or first run)
+        now_ts = time.time()
+        if (
+            self.config.strategy.jev.enabled
+            and self.jev_client.enabled
+            and (now_ts - self._last_regime_check_time >= 900.0 or self._last_regime_result is None)
+        ):
+            btc_15m = self.delta_ws.candle_store.get_candles("BTCUSD", "15m")
+            if len(btc_15m) >= 50:
+                try:
+                    c_highs = np.array([c.high for c in btc_15m])
+                    c_lows = np.array([c.low for c in btc_15m])
+                    c_closes = np.array([c.close for c in btc_15m])
+                    c_vols = np.array([c.volume for c in btc_15m])
+                    atr_15m_arr = compute_atr(c_highs, c_lows, c_closes, 14)
+                    atr_15m_val = float(atr_15m_arr[-1]) if len(atr_15m_arr) > 0 else 50.0
+                    rel_vol_15m = float(c_vols[-1] / (np.mean(c_vols[-20:]) + 1e-9)) if len(c_vols) >= 20 else 1.0
+                    session_info_now = evaluate_session(datetime.now(timezone.utc))
+                    regime_res = await self.jev_client.evaluate_market_regime(
+                        atr_15m=atr_15m_val,
+                        atr_1h=atr_15m_val * 1.5,
+                        bb_bandwidth=0.02,
+                        rel_vol_15m=rel_vol_15m,
+                        session_zone=session_info_now.zone.value if session_info_now else "NORMAL",
+                    )
+                    self._last_regime_result = regime_res
+                    self._last_regime_check_time = now_ts
+                except Exception as e:
+                    logger.debug(f"Failed to evaluate Jev market regime: {e}")
 
         for symbol in universe:
             candles_15m = self.delta_ws.candle_store.get_candles(symbol, "15m")
@@ -661,13 +708,16 @@ class ScalpingBot:
                 entry_price=cur_p,
             )
 
-            # Pattern Memory Check (Sub-millisecond VETO or BOOST)
+            # Pattern Memory Check (Sub-millisecond advisory & confluence)
             pattern_audit = self.pattern_memory.check_pattern(fingerprint)
             if pattern_audit.is_blocked:
-                logger.warning(
-                    f"Pattern Memory VETO for {symbol} {sig.direction}: {pattern_audit.reason}"
+                logger.info(
+                    f"Pattern Memory ADVISORY for {symbol} {sig.direction}: {pattern_audit.reason} (Delegating judgment to Jev)"
                 )
-                self._last_pattern_audit = f"VETO ({pattern_audit.matched_loss_trade_id})"
+                self._last_pattern_audit = f"ADVISORY ({pattern_audit.matched_loss_trade_id} {pattern_audit.matched_loss_similarity*100:.0f}%)"
+                if not (self.config.strategy.jev.enabled and self.jev_client.enabled):
+                    # In offline/fallback mode without Jev, apply a mild score dampener rather than hard crash
+                    score = max(0.0, score - 0.20)
             elif pattern_audit.is_boosted:
                 logger.info(
                     f"Pattern Memory BOOST for {symbol} {sig.direction}: {pattern_audit.reason}"
@@ -704,7 +754,6 @@ class ScalpingBot:
                 and self.jev_client.enabled
                 and structure.is_valid
                 and sig.direction in ("LONG", "SHORT")
-                and not pattern_audit.is_blocked
             ):
                 jev_indicators = {
                     "rsi": sig.rsi,
@@ -720,6 +769,7 @@ class ScalpingBot:
                     structure=structure,
                     fingerprint=fingerprint,
                     session_info=session_info,
+                    pattern_memory_audit=pattern_audit,
                 )
                 if jev_audit:
                     if jev_audit.is_vetoed:
@@ -734,6 +784,8 @@ class ScalpingBot:
                             self._last_jev_verdict = f"VETO (Trap prob {jev_audit.trap_probability:.0%})"
                         elif "Cost friction" in jev_audit.veto_reason:
                             self._last_jev_verdict = "VETO (High Spread/Friction)"
+                        elif "Past mistake pattern" in jev_audit.veto_reason:
+                            self._last_jev_verdict = f"VETO (Past Mistake Risk {jev_audit.setup_grade:.1f}/4.0)"
                         else:
                             self._last_jev_verdict = f"VETO ({jev_audit.veto_reason[:30]})"
                     elif jev_audit.is_boosted:
@@ -746,7 +798,6 @@ class ScalpingBot:
             is_actionable = (
                 structure.is_valid
                 and sig.direction in ("LONG", "SHORT")
-                and not pattern_audit.is_blocked
                 and not (jev_audit and jev_audit.is_vetoed)
                 and (ml_confirmed or score >= score_hurdle)
             )
@@ -766,6 +817,13 @@ class ScalpingBot:
                 "pdl": structure.pdl if getattr(structure, "pdl", 0.0) > 0 else None,
                 "nearest_support": structure.nearest_support if getattr(structure, "nearest_support", 0.0) > 0 else None,
                 "nearest_resistance": structure.nearest_resistance if getattr(structure, "nearest_resistance", 0.0) > 0 else None,
+                "eqh": structure.eqh if getattr(structure, "eqh", 0.0) > 0 else None,
+                "eql": structure.eql if getattr(structure, "eql", 0.0) > 0 else None,
+                "fvg_top": structure.fvg_top if getattr(structure, "fvg_top", 0.0) > 0 else None,
+                "fvg_bottom": structure.fvg_bottom if getattr(structure, "fvg_bottom", 0.0) > 0 else None,
+                "chart_pattern_target": structure.chart_pattern_target if getattr(structure, "chart_pattern_target", 0.0) > 0 else None,
+                "pricing_zone": getattr(structure, "pricing_zone", "EQUILIBRIUM"),
+                "opposing_liquidity": (structure.eqh if sig.direction == "LONG" else structure.eql) if (structure.eqh > 0 or structure.eql > 0) else None,
             }
 
             evaluations.append({
@@ -936,6 +994,10 @@ class ScalpingBot:
             "signal_score": f"ACTIONABLE ({top['score']:.3f})" if top["is_actionable"] else f"RANK #{1} {top['symbol']} ({top['score']:.2f})",
             "next_trigger": next_trigger,
             "setup_type": getattr(top["structure"], "setup_type", "NONE"),
+            "chart_pattern": getattr(top["structure"], "chart_pattern", "NONE"),
+            "chart_pattern_direction": getattr(top["structure"], "chart_pattern_direction", "NONE"),
+            "pricing_zone": getattr(top["structure"], "pricing_zone", "EQUILIBRIUM"),
+            "playbook": getattr(top["structure"], "playbook", "NONE"),
             "pattern": getattr(top["signal"], "pattern", "NONE"),
             "session": getattr(getattr(top.get("session"), "zone", None), "value", "NORMAL"),
             "fvg": f"{top['structure'].fvg_direction} (testing={top['structure'].fvg_testing})" if getattr(top['structure'], "fvg_detected", False) else "--",
@@ -1060,9 +1122,14 @@ class ScalpingBot:
                                     "rsi": f"{sig.rsi:.1f}",
                                     "volume": f"{sig.relative_volume:.2f}x",
                                     "onnx_confidence": self._monitored_market.get("onnx_confidence", "--"),
+                                    "pattern_memory_stats": f"W:{len(self.pattern_memory.winning_patterns)} | L:{len(self.pattern_memory.losing_patterns)}",
+                                    "last_pattern_audit": self._last_pattern_audit,
                                     "llm_status": self.llm_advisor.get_status(),
                                     "jev_status": self.jev_client.get_status(),
                                     "jev_verdict": self._last_jev_verdict,
+                                    "chart_pattern": getattr(struct, "chart_pattern", "NONE"),
+                                    "pricing_zone": getattr(struct, "pricing_zone", "EQUILIBRIUM"),
+                                    "playbook": getattr(struct, "playbook", "NONE"),
                                     "signal_score": f"MONITORING ({self._position_health})",
                                 }
 
@@ -1130,7 +1197,7 @@ class ScalpingBot:
                         exec_cfg = getattr(getattr(self.config, "strategy", None), "execution", None)
                         chosen_order_type = getattr(exec_cfg, "order_type", "market") if exec_cfg else "market"
                         try:
-                            await self.order_manager.validate_and_place_order(
+                            placed_order = await self.order_manager.validate_and_place_order(
                                 symbol=setup["symbol"],
                                 side=setup["signal"].direction,
                                 entry_price=exec_price,
@@ -1149,12 +1216,21 @@ class ScalpingBot:
                                 execution_routing=setup.get("execution_routing", "MAKER_POST_ONLY"),
                             )
 
-                            self._position_health = "STRONG"
+                            if placed_order is not None:
+                                self._position_health = "STRONG"
+                            else:
+                                logger.warning(
+                                    f"Order placement rejected or not placed by OrderManager for {setup['symbol']}",
+                                    extra={"correlation_id": corr_id},
+                                )
+                                self._re_entry_cooldown_until = time.time() + 15.0
+                                self._position_health = "--"
                         except Exception:
                             logger.exception(
                                 "Order placement failed",
                                 extra={"correlation_id": corr_id},
                             )
+                            self._re_entry_cooldown_until = time.time() + 15.0
 
             except asyncio.CancelledError:
                 break

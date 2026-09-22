@@ -2,6 +2,7 @@ import numpy as np
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Any, Dict
 from src.utils.logger import get_logger
+from src.strategy.chart_patterns import ChartPatternEngine, ChartPatternType, PricingZone
 
 logger = get_logger(__name__)
 
@@ -54,6 +55,14 @@ class StructureAnalysis:
     is_volume_absorption: bool = False
     trap_level: float = 0.0
     trap_wick_extreme: float = 0.0
+    chart_pattern: str = "NONE"
+    chart_pattern_direction: str = "NEUTRAL"
+    chart_pattern_conf: float = 0.0
+    chart_pattern_level: float = 0.0
+    chart_pattern_target: float = 0.0
+    pricing_zone: str = "EQUILIBRIUM"
+    range_position_pct: float = 50.0
+    playbook: str = "NONE"
 
     def __post_init__(self):
         if self.support_levels is None:
@@ -1074,6 +1083,36 @@ class MarketStructure:
         elif is_valid:
             setup_type = "TREND_CONTINUATION"
 
+        # TradingView Chart Pattern & Premium/Discount Analysis
+        sw_hi_5, sw_lo_5 = self.find_swing_points(hi_5, lo_5) if len(hi_5) >= 5 else ([], [])
+        range_h = max(pdh, float(np.max(hi_15))) if len(hi_15) > 0 else (pdh if pdh > 0 else 0.0)
+        range_l = min(pdl, float(np.min(lo_15))) if len(lo_15) > 0 and pdl > 0 else (pdl if pdl > 0 else 0.0)
+
+        chart_res = ChartPatternEngine.analyze(
+            high=hi_5,
+            low=lo_5,
+            close=cl_5,
+            volume=vol_5,
+            swing_highs=sw_hi_5,
+            swing_lows=sw_lo_5,
+            range_high=range_h,
+            range_low=range_l,
+        )
+
+        # Classify Pro Trading Playbook for Jev AI
+        if is_judas_swing or (liquidity_sweep_5m and (asian_high > 0 or asian_low > 0)) or is_bull_trap or is_bear_trap:
+            playbook = "ICT_JUDAS_SWEEP"
+        elif ob_testing or fvg_testing:
+            playbook = "ORDER_BLOCK_FVG_PULLBACK"
+        elif squeeze_fired or is_squeeze:
+            playbook = "CARTER_SQUEEZE_BREAKOUT"
+        elif at_key_level and (poc > 0):
+            playbook = "VALUE_AREA_MEAN_REVERSION"
+        elif chart_res.pattern_type != "NONE":
+            playbook = f"CHART_{chart_res.pattern_type}"
+        else:
+            playbook = "TREND_CONTINUATION" if bias_15m != "NEUTRAL" else "RANGE_EXPANSION"
+
         return StructureAnalysis(
             bias_15m=bias_15m,
             bos_5m=bos_5m,
@@ -1122,4 +1161,12 @@ class MarketStructure:
             is_volume_absorption=is_vol_abs,
             trap_level=trap_lvl,
             trap_wick_extreme=trap_wick_ext,
+            chart_pattern=chart_res.pattern_type,
+            chart_pattern_direction=chart_res.direction,
+            chart_pattern_conf=chart_res.confidence,
+            chart_pattern_level=chart_res.key_level,
+            chart_pattern_target=chart_res.target_price,
+            pricing_zone=chart_res.pricing_zone,
+            range_position_pct=chart_res.range_position_pct,
+            playbook=playbook,
         )
