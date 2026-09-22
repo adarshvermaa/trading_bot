@@ -119,6 +119,12 @@ class JevConfig(BaseModel):
     min_setup_grade: float = 2.5
     enable_active_monitoring: bool = True
     enable_mistake_forensics: bool = True
+    enable_dynamic_sl_tp: bool = True
+    enable_dynamic_trailing: bool = True
+    min_risk_reward_ratio: float = 2.0
+    target_risk_reward_ratio: float = 2.5
+    max_risk_reward_ratio: float = 5.0
+    trailing_interval_seconds: int = 5
 
 
 class StrategyConfig(BaseModel):

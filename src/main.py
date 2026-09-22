@@ -94,7 +94,7 @@ class ScalpingBot:
         )
 
         # ---- Risk layer ----
-        self.risk_manager = RiskManager(config.risk)
+        self.risk_manager = RiskManager(config.risk, jev_client=self.jev_client)
 
         # ---- Portfolio layer ----
         self.account_manager = AccountManager(
@@ -127,6 +127,11 @@ class ScalpingBot:
         self._last_close_reason: str = ""
         self._last_pattern_audit: str = "NEUTRAL"
         self._last_jev_verdict: str = "--"
+        self._last_regime_check_time: float = 0.0
+        self._last_regime_result: Optional[Any] = None
+        self._last_smt_result: Optional[Any] = None
+        self._last_conviction_mult: float = 1.0
+        self._last_routing_choice: str = "MAKER_POST_ONLY"
         self._re_entry_cooldown_until: float = 0.0
         self._asset_rankings: list[dict[str, Any]] = []
         self._market_watch: dict[str, Any] = {"assets": {}}
@@ -312,15 +317,50 @@ class ScalpingBot:
                         )
                         logger.info(f"[BREAKEVEN SL] {symbol}: {be_msg}")
 
-                    # 1b-ii. Dynamic Stepped Trailing Stop Loss on Margin P&L
-                    new_sl, updated, msg = self.risk_manager.calculate_trailing_stop_loss(
-                        entry_price=active.entry_price,
+                    # 1b-ii. Dynamic Trailing Stop Loss (Jev AI System One with Structural Swing & Stepped Fallback)
+                    c_1m = (
+                        self.candle_store.get_candles(symbol, "1m")
+                        if (hasattr(self, "candle_store") and self.candle_store)
+                        else (self.delta_ws.candle_store.get_candles(symbol, "1m") if hasattr(self, "delta_ws") and self.delta_ws else [])
+                    )
+                    swing_low_1m = None
+                    swing_high_1m = None
+                    if c_1m and len(c_1m) >= 5:
+                        sub_lows = [float(c.low if hasattr(c, "low") else c["low"]) for c in c_1m[-15:]]
+                        sub_highs = [float(c.high if hasattr(c, "high") else c["high"]) for c in c_1m[-15:]]
+                        swing_low_1m = min(sub_lows[-5:])
+                        swing_high_1m = max(sub_highs[-5:])
+
+                    live_tech_levels = {
+                        "swing_low": swing_low_1m,
+                        "swing_high": swing_high_1m,
+                        "rsi": getattr(self, "_monitored_market", {}).get("rsi", 50.0),
+                    }
+                    try:
+                        live_tech_levels["rsi"] = float(live_tech_levels["rsi"])
+                    except (ValueError, TypeError):
+                        live_tech_levels["rsi"] = 50.0
+
+                    hold_duration = time.time() - (active.created_at or time.time())
+                    pos_atr = (
+                        getattr(self, "_current_atr", {}).get(symbol, 100.0)
+                        if hasattr(self, "_current_atr")
+                        else 100.0
+                    )
+
+                    new_sl, updated, msg = await self.risk_manager.calculate_dynamic_jev_trailing_stop(
+                        symbol=symbol,
                         side=active.side,
-                        margin=margin,
+                        entry_price=active.entry_price,
                         current_price=live_price,
+                        current_sl=active.sl_price or 0.0,
+                        initial_sl=initial_sl_val,
+                        margin=margin,
                         contract_value=cv,
                         size=int(active.size),
-                        current_sl=active.sl_price or 0.0,
+                        duration_seconds=hold_duration,
+                        atr=pos_atr,
+                        technical_levels=live_tech_levels,
                         tick_size=tick_size,
                     )
                     if updated:
@@ -333,30 +373,7 @@ class ScalpingBot:
                             side=active.side,
                             size=active.size,
                         )
-                        logger.info(f"[TRAILING SL] {symbol}: {msg}")
-
-                    # 1b-iii. Structural Swing Trailing Stop Loss (1m Swing Points)
-                    c_1m = self.ws_client.store.get_candles(symbol, "1m") if (hasattr(self, "ws_client") and self.ws_client) else []
-                    if c_1m and len(c_1m) >= 5:
-                        struct_sl, struct_updated, struct_msg = self.risk_manager.calculate_structural_trailing_stop_loss(
-                            entry_price=active.entry_price,
-                            side=active.side,
-                            current_price=live_price,
-                            current_sl=active.sl_price or 0.0,
-                            candles_1m=c_1m,
-                            tick_size=tick_size,
-                        )
-                        if struct_updated:
-                            self.order_manager.update_active_sl(struct_sl)
-                            await self.delta_client.update_bracket_stop_loss(
-                                product_id,
-                                struct_sl,
-                                tick_size,
-                                order_id=active.order_id,
-                                side=active.side,
-                                size=active.size,
-                            )
-                            logger.info(f"[STRUCTURAL TRAILING SL] {symbol}: {struct_msg}")
+                        logger.info(f"[DYNAMIC TRAILING SL] {symbol}: {msg}")
 
                 # --- 2. Check SL/TP triggers (Dual-Layer: Live Exchange Execution + Bot Failsafe) ---
                 trigger_reason: Optional[str] = None
@@ -486,6 +503,34 @@ class ScalpingBot:
                                 self._position_health = "--"
                                 self._re_entry_cooldown_until = time.time() + 10.0
                                 continue
+
+                            # Jev Pre-Emptive Scratch Exit (Early flat cut before full -3% SL)
+                            if hasattr(self.jev_client, "evaluate_scratch_exit"):
+                                duration_sec = time.time() - getattr(active, "created_at", time.time())
+                                scratch_res = await self.jev_client.evaluate_scratch_exit(
+                                    symbol=symbol,
+                                    side=active.side,
+                                    seconds_held=duration_sec,
+                                    unrealized_pnl_pct=(pos_pnl / (active.entry_price * 0.04)) * 100.0 if (active.entry_price > 0 and pos_pnl != 0) else 0.0,
+                                    delta_absorbed_str="STALL" if "stalled" in reason.lower() else "NORMAL",
+                                    candle_stall_reason=reason,
+                                )
+                                if scratch_res and scratch_res.should_scratch:
+                                    logger.warning(
+                                        f"[JEV PRE-EMPTIVE SCRATCH EXIT] Triggering flat cut for {symbol} {active.side}: {scratch_res.reason}"
+                                    )
+                                    product = await self.delta_client.get_product(symbol)
+                                    cv = float(product.get("contract_value", 1.0)) if product else 1.0
+                                    pnl = await self.order_manager.close_and_record(
+                                        reason=f"SCRATCH_EXIT: {scratch_res.thesis_integrity}",
+                                        close_price=live_price,
+                                        contract_value=cv,
+                                    )
+                                    self.order_manager.clear_closed_orders()
+                                    self._last_close_reason = "SCRATCH_EXIT"
+                                    self._position_health = "--"
+                                    self._re_entry_cooldown_until = time.time() + 10.0
+                                    continue
 
             except asyncio.CancelledError:
                 break
@@ -681,7 +726,16 @@ class ScalpingBot:
                         logger.warning(
                             f"[JEV VETO] {symbol} {sig.direction} rejected: {jev_audit.veto_reason}"
                         )
-                        self._last_jev_verdict = f"VETO ({jev_audit.veto_reason[:20]})"
+                        if "Poor setup quality" in jev_audit.veto_reason:
+                            self._last_jev_verdict = f"VETO (Low Grade {jev_audit.setup_grade:.1f}/4.0 < 1.5)"
+                        elif "Direction conflict" in jev_audit.veto_reason:
+                            self._last_jev_verdict = f"VETO (Dir conflict vs {jev_audit.direction_bias})"
+                        elif "Trap risk" in jev_audit.veto_reason:
+                            self._last_jev_verdict = f"VETO (Trap prob {jev_audit.trap_probability:.0%})"
+                        elif "Cost friction" in jev_audit.veto_reason:
+                            self._last_jev_verdict = "VETO (High Spread/Friction)"
+                        else:
+                            self._last_jev_verdict = f"VETO ({jev_audit.veto_reason[:30]})"
                     elif jev_audit.is_boosted:
                         score += jev_audit.boost_amount
                         self._last_jev_verdict = f"BOOST (+{jev_audit.boost_amount:.2f}, Grd={jev_audit.setup_grade:.1f})"
@@ -697,6 +751,23 @@ class ScalpingBot:
                 and (ml_confirmed or score >= score_hurdle)
             )
 
+            # Extract ICT structural levels for Jev dynamic SL/TP
+            swing_low_val = min([c.low for c in candles_1m[-15:]]) if len(candles_1m) >= 15 else (candles_1m[-1].low if candles_1m else None)
+            swing_high_val = max([c.high for c in candles_1m[-15:]]) if len(candles_1m) >= 15 else (candles_1m[-1].high if candles_1m else None)
+            tech_levels = {
+                "swing_low": swing_low_val,
+                "swing_high": swing_high_val,
+                "ob_bottom": structure.ob_bottom if getattr(structure, "ob_bottom", 0.0) > 0 else None,
+                "ob_top": structure.ob_top if getattr(structure, "ob_top", 0.0) > 0 else None,
+                "trap_wick_price": structure.trap_wick_extreme if getattr(structure, "trap_wick_extreme", 0.0) > 0 else getattr(sig, "trap_wick_price", None),
+                "vah": structure.vah if getattr(structure, "vah", 0.0) > 0 else None,
+                "val": structure.val if getattr(structure, "val", 0.0) > 0 else None,
+                "pdh": structure.pdh if getattr(structure, "pdh", 0.0) > 0 else None,
+                "pdl": structure.pdl if getattr(structure, "pdl", 0.0) > 0 else None,
+                "nearest_support": structure.nearest_support if getattr(structure, "nearest_support", 0.0) > 0 else None,
+                "nearest_resistance": structure.nearest_resistance if getattr(structure, "nearest_resistance", 0.0) > 0 else None,
+            }
+
             evaluations.append({
                 "symbol": symbol,
                 "signal": sig,
@@ -709,21 +780,87 @@ class ScalpingBot:
                 "atr": current_atr,
                 "is_actionable": is_actionable,
                 "fingerprint": fingerprint,
+                "technical_levels": tech_levels,
             })
 
         if not evaluations:
             return None
 
+        # Cross-Asset ICT SMT Divergence check
+        if len(evaluations) >= 2 and self.jev_client and getattr(self.jev_client, "enabled", False):
+            btc_e = next((x for x in evaluations if x["symbol"] == "BTCUSD"), None)
+            eth_e = next((x for x in evaluations if x["symbol"] == "ETHUSD"), None)
+            if btc_e and eth_e:
+                btc_5m = self.delta_ws.candle_store.get_candles("BTCUSD", "5m")
+                eth_5m = self.delta_ws.candle_store.get_candles("ETHUSD", "5m")
+                b_delta = ((btc_5m[-1].close - btc_5m[-2].close) / btc_5m[-2].close * 100.0) if len(btc_5m) >= 2 else 0.0
+                e_delta = ((eth_5m[-1].close - eth_5m[-2].close) / eth_5m[-2].close * 100.0) if len(eth_5m) >= 2 else 0.0
+                try:
+                    self._last_smt_result = await self.jev_client.evaluate_cross_asset_smt(
+                        btc_delta_5m=b_delta,
+                        eth_delta_5m=e_delta,
+                        btc_bias=btc_e["structure"].bias_15m,
+                        eth_bias=eth_e["structure"].bias_15m,
+                        btc_bos=btc_e["structure"].bos_5m,
+                        eth_bos=eth_e["structure"].bos_5m,
+                    )
+                    if self._last_smt_result and self._last_smt_result.is_trap_warning:
+                        if self._last_smt_result.favored_asset == "TRADE_BTC":
+                            eth_e["is_actionable"] = False
+                        elif self._last_smt_result.favored_asset == "TRADE_ETH":
+                            btc_e["is_actionable"] = False
+                        elif self._last_smt_result.favored_asset == "AVOID_BOTH":
+                            btc_e["is_actionable"] = False
+                            eth_e["is_actionable"] = False
+                except Exception as ex:
+                    logger.debug(f"SMT check error: {ex}")
+
         # Sort rankings: Actionable triggers first, then by highest score
         evaluations.sort(key=lambda x: (1 if x["is_actionable"] else 0, x["score"]), reverse=True)
         self._asset_rankings = evaluations
+
+        top = evaluations[0]
+        conviction_mult = 1.0
+        routing_choice = "MAKER_POST_ONLY"
+
+        if top["is_actionable"] and self.jev_client and getattr(self.jev_client, "enabled", False):
+            # Conviction Sizing (0.5x to 1.5x)
+            try:
+                grade_val = 3.0 if top.get("ml_confirmed") else 2.5
+                size_res = await self.jev_client.evaluate_conviction_sizing(
+                    symbol=top["symbol"],
+                    setup_grade=grade_val,
+                    dir_conf=top.get("score", 0.8),
+                    onnx_conf=top.get("ml_confidence", 0.7),
+                )
+                if size_res:
+                    conviction_mult = size_res.conviction_multiplier
+                    self._last_conviction_mult = conviction_mult
+            except Exception as ex:
+                logger.debug(f"Conviction sizing error: {ex}")
+
+            # Smart Execution Routing (Maker vs Market)
+            try:
+                route_res = await self.jev_client.evaluate_execution_routing(
+                    symbol=top["symbol"],
+                    side=top["signal"].direction,
+                    spread_bps=1.0,
+                    tape_velocity_1m=1.5,
+                )
+                if route_res:
+                    routing_choice = route_res.order_type
+                    self._last_routing_choice = routing_choice
+            except Exception as ex:
+                logger.debug(f"Routing error: {ex}")
+
+        top["conviction_multiplier"] = conviction_mult
+        top["execution_routing"] = routing_choice
 
         # Formatted ranking summary string for dashboard: e.g. "#1 BTCUSD: 0.78 (LONG) | #2 ETHUSD: 0.62 (NONE)"
         rankings_str = " | ".join(
             [f"#{i+1} {e['symbol']} ({e['score']:.2f}, {e['signal'].direction})" for i, e in enumerate(evaluations)]
         )
 
-        top = evaluations[0]
         next_trigger = "CONFLUENCE READY TO EXECUTE" if top["is_actionable"] else "Awaiting 5M BOS/CHoCH + ML >= 65%"
 
         # Build real-time market watch data for dashboard
@@ -750,6 +887,7 @@ class ScalpingBot:
                 "direction": e["signal"].direction,
                 "score": e["score"],
                 "rsi": e["signal"].rsi,
+                "volume": getattr(e["signal"], "relative_volume", 1.0),
                 "actionable": e["is_actionable"],
                 "setup_type": getattr(e["structure"], "setup_type", "NONE"),
                 "pattern": getattr(e["signal"], "pattern", "NONE"),
@@ -801,6 +939,10 @@ class ScalpingBot:
             "pattern": getattr(top["signal"], "pattern", "NONE"),
             "session": getattr(getattr(top.get("session"), "zone", None), "value", "NORMAL"),
             "fvg": f"{top['structure'].fvg_direction} (testing={top['structure'].fvg_testing})" if getattr(top['structure'], "fvg_detected", False) else "--",
+            "regime_status": getattr(self._last_regime_result, "market_regime", "EXPANSION") if self._last_regime_result else "EXPANSION",
+            "smt_status": "SMT TRAP ALERT" if (self._last_smt_result and self._last_smt_result.is_trap_warning) else "SYNC",
+            "conviction_mult": f"{self._last_conviction_mult:.2f}x",
+            "routing_mode": self._last_routing_choice,
         }
 
         # Return best setup if actionable
@@ -1002,6 +1144,9 @@ class ScalpingBot:
                                 setup_type=getattr(setup["signal"], "setup_type", "NONE"),
                                 trap_wick_price=getattr(setup["signal"], "trap_wick_price", None),
                                 fingerprint=setup.get("fingerprint"),
+                                technical_levels=setup.get("technical_levels"),
+                                conviction_multiplier=setup.get("conviction_multiplier", 1.0),
+                                execution_routing=setup.get("execution_routing", "MAKER_POST_ONLY"),
                             )
 
                             self._position_health = "STRONG"
@@ -1088,6 +1233,12 @@ class ScalpingBot:
                                 position_data["tp"] = ao.tp_price
                             if not position_data.get("leverage") or position_data.get("leverage") <= 1:
                                 position_data["leverage"] = self.config.risk.leverage.high_leverage_value
+                            position_data["sl_anchor"] = getattr(ao, "sl_anchor", None)
+                            position_data["tp_target_type"] = getattr(ao, "tp_target_type", None)
+                            position_data["target_rr"] = getattr(ao, "target_rr", None)
+                            position_data["realized_rr"] = getattr(ao, "realized_rr", None)
+                            position_data["cushion_grade"] = getattr(ao, "cushion_grade", None)
+                            position_data["execution_routing"] = getattr(ao, "execution_routing", None)
 
                     # Signal data: use monitored_market (updated by strategy loop during position)
                     signal_data = dict(self._monitored_market) if self._monitored_market else {}

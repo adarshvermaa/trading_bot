@@ -45,8 +45,9 @@ def format_price(price: float, tick_size: float) -> str:
 
 
 class RiskManager:
-    def __init__(self, config: RiskConfig):
+    def __init__(self, config: RiskConfig, jev_client: Optional[Any] = None):
         self.config = config
+        self.jev_client = jev_client
         
         # State tracking
         self.daily_pnl: float = 0.0
@@ -382,8 +383,16 @@ class RiskManager:
             else:
                 return current_sl, False, f"Structural candidate SL ${candidate_sl:,.2f} >= current SL ${current_sl:,.2f}"
 
-    def calculate_position_size(self, equity: float, price: float, leverage: int, contract_value: float) -> Tuple[int, float, float]:
-        allocatable = equity * self.config.capital.max_allocation_pct
+    def calculate_position_size(
+        self,
+        equity: float,
+        price: float,
+        leverage: int,
+        contract_value: float,
+        conviction_multiplier: float = 1.0,
+    ) -> Tuple[int, float, float]:
+        safe_mult = max(0.5, min(1.5, float(conviction_multiplier)))
+        allocatable = equity * self.config.capital.max_allocation_pct * safe_mult
         margin = allocatable
         notional = margin * leverage
         size = int(notional / (contract_value * price)) if (contract_value * price) > 0 else 0
@@ -412,6 +421,243 @@ class RiskManager:
         )
         return sl_price, tp_price
 
+    def validate_risk_reward_ratio(
+        self,
+        entry_price: float,
+        sl_price: float,
+        tp_price: float,
+        side: str = "LONG",
+        min_rr: float = 2.0,
+    ) -> Tuple[bool, float, str]:
+        """Validate that proposed trade setup strictly meets institutional Risk-to-Reward ratio (>= min_rr, default 2.0R).
+        
+        Returns: (is_valid: bool, actual_rr: float, reason: str)
+        """
+        if entry_price <= 0 or sl_price <= 0 or tp_price <= 0:
+            return False, 0.0, "Invalid price values (<= 0)"
+
+        is_long = side.upper() in ('LONG', 'BUY')
+        if is_long:
+            risk = entry_price - sl_price
+            reward = tp_price - entry_price
+            if risk <= 0:
+                return False, 0.0, f"Invalid risk: SL (${sl_price:,.2f}) must be below entry (${entry_price:,.2f}) for Long"
+            if reward <= 0:
+                return False, 0.0, f"Invalid reward: TP (${tp_price:,.2f}) must be above entry (${entry_price:,.2f}) for Long"
+        else:
+            risk = sl_price - entry_price
+            reward = entry_price - tp_price
+            if risk <= 0:
+                return False, 0.0, f"Invalid risk: SL (${sl_price:,.2f}) must be above entry (${entry_price:,.2f}) for Short"
+            if reward <= 0:
+                return False, 0.0, f"Invalid reward: TP (${tp_price:,.2f}) must be below entry (${entry_price:,.2f}) for Short"
+
+        rr = reward / risk
+        if rr < (min_rr - 1e-4):
+            return False, round(rr, 2), f"Risk:Reward {rr:.2f}R is below institutional threshold {min_rr:.1f}R"
+
+        return True, round(rr, 2), "VALID"
+
+    async def calculate_sl_tp_async(
+        self,
+        side: str,
+        entry_price: float,
+        margin: float = 1000.0,
+        leverage: int = 10,
+        contract_value: float = 1.0,
+        size: int = 1,
+        atr: float = 100.0,
+        tick_size: Optional[float] = None,
+        technical_levels: Optional[Dict[str, Any]] = None,
+        setup_type: Optional[str] = None,
+        trap_wick_price: Optional[float] = None,
+        symbol: str = "UNKNOWN",
+    ) -> Tuple[float, float, Dict[str, Any]]:
+        """Calculate Stop Loss and Take Profit levels dynamically using Jev System One if available,
+        with fallback to institutional technical rules.
+        
+        Guarantees:
+        - Capital Loss Ceiling: SL cannot exceed max loss pct of margin (default 3%).
+        - Risk:Reward Ratio: Enforces institutional minimum R:R (>= min_risk_reward_ratio, default 2.0R to 5.0R).
+        
+        Returns: (sl_price, tp_price, metadata_dict)
+        """
+        qty = (size * contract_value) if (size > 0 and contract_value > 0) else 0.0
+        max_loss_pct = self.config.stop_loss.max_loss_pct_of_margin
+        # If size and margin are consistent with leverage (notional ~ margin * leverage), use loss_amount / qty
+        # Otherwise, leverage dictates the max loss price diff on the entry price.
+        if qty > 0 and margin > 0 and abs((qty * entry_price) - (margin * leverage)) < (margin * leverage * 0.5):
+            max_loss_price_diff = (margin * max_loss_pct) / qty
+        else:
+            max_loss_price_diff = entry_price * (max_loss_pct / max(1, leverage))
+
+        is_long = side.upper() in ('LONG', 'BUY')
+        jev_enabled = bool(
+            self.jev_client
+            and getattr(self.jev_client, "enabled", False)
+            and getattr(getattr(self.jev_client, "config", None), "enable_dynamic_sl_tp", True)
+        )
+
+        jev_result = None
+        if jev_enabled:
+            try:
+                levels = dict(technical_levels or {})
+                if trap_wick_price and "trap_wick_price" not in levels:
+                    levels["trap_wick_price"] = trap_wick_price
+                
+                jev_result = await self.jev_client.evaluate_dynamic_sl_tp(
+                    symbol=symbol,
+                    direction=side,
+                    entry_price=entry_price,
+                    atr=atr,
+                    technical_levels=levels,
+                    max_loss_price_diff=max_loss_price_diff,
+                    tick_size=tick_size or 0.1,
+                )
+            except Exception as e:
+                logger.error(f"Error calling Jev evaluate_dynamic_sl_tp: {e}", exc_info=True)
+                jev_result = None
+
+        if jev_result:
+            sl_price = jev_result.sl_price
+            tp_price = jev_result.tp_price
+
+            # Strictly enforce Capital Safety Ceiling: SL must not lose more than max_loss_pct of margin
+            if is_long:
+                hard_floor = entry_price - max_loss_price_diff
+                if sl_price < hard_floor:
+                    sl_price = round_to_tick(hard_floor, tick_size, direction='DOWN') if tick_size else hard_floor
+            else:
+                hard_ceiling = entry_price + max_loss_price_diff
+                if sl_price > hard_ceiling:
+                    sl_price = round_to_tick(hard_ceiling, tick_size, direction='UP') if tick_size else hard_ceiling
+
+            min_rr = getattr(getattr(self.jev_client, "config", None), "min_risk_reward_ratio", 2.0)
+            is_valid_rr, actual_rr, _ = self.validate_risk_reward_ratio(entry_price, sl_price, tp_price, side=side, min_rr=min_rr)
+            if not is_valid_rr:
+                # Dynamically adjust TP to satisfy min_rr requirement
+                risk = abs(entry_price - sl_price)
+                if is_long:
+                    tp_price = entry_price + (min_rr * risk)
+                    if tick_size and tick_size > 0:
+                        tp_price = round_to_tick(tp_price, tick_size, direction='UP')
+                else:
+                    tp_price = max(0.0, entry_price - (min_rr * risk))
+                    if tick_size and tick_size > 0:
+                        tp_price = round_to_tick(tp_price, tick_size, direction='DOWN')
+                actual_rr = min_rr
+
+            metadata = {
+                "source": "JEV",
+                "sl_anchor": jev_result.sl_anchor,
+                "tp_target_type": jev_result.tp_target_type,
+                "target_rr": jev_result.target_rr_multiple,
+                "realized_rr": actual_rr,
+                "cushion_grade": jev_result.sl_cushion_grade,
+                "confidence": jev_result.confidence,
+                "latency_ms": jev_result.latency_ms,
+            }
+            return sl_price, tp_price, metadata
+
+        # Institutional Fallback
+        sl_price, tp_price = self.calculate_sl_tp(
+            side=side,
+            entry_price=entry_price,
+            margin=margin,
+            leverage=leverage,
+            contract_value=contract_value,
+            size=size,
+            atr=atr,
+            tick_size=tick_size,
+            structural_target=(technical_levels or {}).get("nearest_resistance" if is_long else "nearest_support"),
+            setup_type=setup_type,
+            trap_wick_price=trap_wick_price,
+        )
+        _, actual_rr, _ = self.validate_risk_reward_ratio(entry_price, sl_price, tp_price, side=side, min_rr=1.5)
+        metadata = {
+            "source": "FALLBACK",
+            "sl_anchor": "TRAP_WICK" if trap_wick_price else "MAX_MARGIN_LOSS",
+            "tp_target_type": "STRUCTURAL" if (technical_levels or {}).get("nearest_resistance" if is_long else "nearest_support") else "MARGIN_TARGET",
+            "target_rr": actual_rr,
+            "realized_rr": actual_rr,
+            "cushion_grade": 2.0,
+            "confidence": 1.0,
+            "latency_ms": 0.0,
+        }
+        return sl_price, tp_price, metadata
+
+    async def calculate_dynamic_jev_trailing_stop(
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        current_price: float,
+        current_sl: float,
+        initial_sl: float,
+        margin: float,
+        contract_value: float,
+        size: int,
+        duration_seconds: float,
+        atr: float,
+        technical_levels: Optional[Dict[str, Any]] = None,
+        tick_size: Optional[float] = None,
+    ) -> Tuple[float, bool, str]:
+        """Calculate dynamic trailing stop using Jev System One evaluation.
+        
+        Guarantees Ratchet Invariant: Stop Loss can ONLY move in favor of the position (never backwards).
+        Falls back to stepped margin trailing stop if Jev is unavailable or fails.
+        """
+        qty = (size * contract_value) if (size > 0 and contract_value > 0) else 0.0
+        is_long = side.upper() in ('LONG', 'BUY')
+        unrealized_pnl = ((current_price - entry_price) * qty) if is_long else ((entry_price - current_price) * qty)
+
+        jev_enabled = bool(
+            self.jev_client
+            and getattr(self.jev_client, "enabled", False)
+            and getattr(getattr(self.jev_client, "config", None), "enable_dynamic_trailing", True)
+        )
+
+        if jev_enabled:
+            try:
+                jev_res = await self.jev_client.evaluate_dynamic_trailing_stop(
+                    symbol=symbol,
+                    side=side,
+                    entry_price=entry_price,
+                    current_price=current_price,
+                    current_sl=current_sl,
+                    initial_sl=initial_sl,
+                    unrealized_pnl=unrealized_pnl,
+                    duration_seconds=duration_seconds,
+                    atr=atr,
+                    technical_levels=technical_levels or {},
+                    tick_size=tick_size or 0.1,
+                )
+                if jev_res:
+                    candidate_sl = jev_res.candidate_sl_price
+                    # Extra verification of ratchet invariant:
+                    if is_long:
+                        if candidate_sl > current_sl:
+                            return candidate_sl, True, f"Jev dynamic trailing ({jev_res.action}): SL moved to ${candidate_sl:,.2f}"
+                        return current_sl, False, f"Jev dynamic trailing held: ${candidate_sl:,.2f} <= current SL ${current_sl:,.2f}"
+                    else:
+                        if current_sl <= 0 or candidate_sl < current_sl:
+                            return candidate_sl, True, f"Jev dynamic trailing ({jev_res.action}): SL moved to ${candidate_sl:,.2f}"
+                        return current_sl, False, f"Jev dynamic trailing held: ${candidate_sl:,.2f} >= current SL ${current_sl:,.2f}"
+            except Exception as e:
+                logger.error(f"Error in Jev dynamic trailing stop: {e}", exc_info=True)
+
+        # Fallback to standard stepped trailing stop loss
+        return self.calculate_trailing_stop_loss(
+            entry_price=entry_price,
+            side=side,
+            margin=margin,
+            current_price=current_price,
+            contract_value=contract_value,
+            size=size,
+            current_sl=current_sl,
+            tick_size=tick_size,
+        )
+
     def validate_trade(self, equity: float, margin: float, notional: float, leverage: int = 1, sl_price: float = 1.0, 
                        tp_price: float = 1.0, entry_price: float = 1.0, side: str = "LONG", atr: float = 100.0, 
                        spread_bps: float = 0.0, has_position: bool = False, **kwargs: Any) -> Tuple[bool, str]:
@@ -430,7 +676,9 @@ class RiskManager:
 
         # Allow single minimum contract if margin <= equity even if it slightly exceeds allocation cap for micro balances
         allow_micro_min_contract = (margin <= equity) and (equity <= 10.0 or kwargs.get("is_min_contract", False))
-        if margin > equity * self.config.capital.max_allocation_pct and not allow_micro_min_contract:
+        conv_mult = float(kwargs.get("conviction_multiplier", 1.0))
+        effective_alloc_cap = self.config.capital.max_allocation_pct * max(1.0, min(1.5, conv_mult))
+        if margin > equity * effective_alloc_cap and not allow_micro_min_contract:
             return False, "INSUFFICIENT_EQUITY"
 
         if self.daily_start_equity > 0:

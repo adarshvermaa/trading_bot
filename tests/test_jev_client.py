@@ -249,7 +249,7 @@ async def test_live_handshake_if_api_key_present():
     if not key:
         pytest.skip("No live JEV_LLM key present in environment.")
 
-    cfg = JevConfig(enabled=True, model="jev-latest", timeout_ms=2000)
+    cfg = JevConfig(enabled=True, model="jev-latest", timeout_ms=3500)
     client = JevClient(api_key=key, config=cfg)
 
     try:

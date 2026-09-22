@@ -40,6 +40,10 @@ class AccountManager:
         self.reserve: float = (self.equity * 0.20) if is_paper else 0.0
         self.daily_pnl: float = 0.0
         self.daily_start_equity: float = self.equity
+        self.total_trades: int = 0
+        self.winning_trades: int = 0
+        self.losing_trades: int = 0
+        self.total_realized_pnl: float = 0.0
         self.contract_values: Dict[str, float] = dict(CONTRACT_VALUES)
         
         self.positions: Dict[str, Position] = {}
@@ -175,6 +179,12 @@ class AccountManager:
                 pnl = (pos.entry_price - close_price) * pos.size * cv
             self.equity += pnl
             self.daily_pnl += pnl
+            self.total_trades += 1
+            if pnl > 0:
+                self.winning_trades += 1
+            elif pnl < 0:
+                self.losing_trades += 1
+            self.total_realized_pnl += pnl
             self.used_margin = sum(p.margin for p in self.positions.values())
             self.available_margin = max(0.0, self.equity - self.used_margin)
             self.reserve = self.equity * 0.20
@@ -218,16 +228,38 @@ class AccountManager:
         used_margin_pct = (self.used_margin / self.equity * 100.0) if self.equity > 0 else 0.0
         reserve_pct = (self.reserve / self.equity * 100.0) if self.equity > 0 else 20.0
         daily_loss_limit = -0.03 * self.daily_start_equity if self.daily_start_equity > 0 else -300.0
+        
+        # Real-time net equity (cash wallet balance + floating unrealized PnL from all open positions)
+        total_unrealized = sum(float(getattr(p, "unrealized_pnl", 0.0)) for p in self.positions.values())
+        net_equity = self.equity + total_unrealized
+        
+        daily_pnl_pct = (self.daily_pnl / self.daily_start_equity * 100.0) if self.daily_start_equity > 0 else 0.0
+        win_rate_pct = (self.winning_trades / self.total_trades * 100.0) if self.total_trades > 0 else 0.0
+        
+        # Drawdown tracking relative to daily stop limit
+        current_drawdown = max(0.0, -self.daily_pnl)
+        max_drawdown_allowed = abs(daily_loss_limit)
+        drawdown_pct = (current_drawdown / max_drawdown_allowed * 100.0) if max_drawdown_allowed > 0 else 0.0
+
         return {
-            "equity": self.equity,
+            "equity": self.equity,  # Backward compatible
+            "wallet_balance": self.equity,
+            "unrealized_pnl": total_unrealized,
+            "net_equity": net_equity,
             "available_margin": self.available_margin,
             "used_margin": self.used_margin,
             "used_margin_pct": used_margin_pct,
             "reserve_pct": reserve_pct,
             "daily_pnl": self.daily_pnl,
+            "daily_pnl_pct": daily_pnl_pct,
             "daily_loss_limit": daily_loss_limit,
+            "daily_drawdown_pct": min(100.0, drawdown_pct),
+            "total_trades": self.total_trades,
+            "winning_trades": self.winning_trades,
+            "losing_trades": self.losing_trades,
+            "win_rate_pct": win_rate_pct,
             "positions": [asdict(p) for p in self.positions.values()],
-            "is_paper": self.is_paper
+            "is_paper": self.is_paper,
         }
 
     def save_state(self, path: str):
@@ -237,6 +269,10 @@ class AccountManager:
             "used_margin": self.used_margin,
             "daily_pnl": self.daily_pnl,
             "daily_start_equity": self.daily_start_equity,
+            "total_trades": self.total_trades,
+            "winning_trades": self.winning_trades,
+            "losing_trades": self.losing_trades,
+            "total_realized_pnl": self.total_realized_pnl,
             "positions": {sym: asdict(pos) for sym, pos in self.positions.items()}
         }
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -257,6 +293,10 @@ class AccountManager:
         self.used_margin = state.get("used_margin", self.used_margin)
         self.daily_pnl = state.get("daily_pnl", self.daily_pnl)
         self.daily_start_equity = state.get("daily_start_equity", self.daily_start_equity)
+        self.total_trades = state.get("total_trades", self.total_trades)
+        self.winning_trades = state.get("winning_trades", self.winning_trades)
+        self.losing_trades = state.get("losing_trades", self.losing_trades)
+        self.total_realized_pnl = state.get("total_realized_pnl", self.total_realized_pnl)
         
         pos_data = state.get("positions", {})
         self.positions = {}

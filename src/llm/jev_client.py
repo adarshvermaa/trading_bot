@@ -1,7 +1,8 @@
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+import math
 
 import aiohttp
 
@@ -9,6 +10,47 @@ from src.config import JevConfig
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _round_to_tick(price: float, tick_size: float, direction: str = "NEAREST") -> float:
+    """Internal helper to round prices to tick boundaries."""
+    if not tick_size or tick_size <= 0:
+        return price
+    tick_str = f"{tick_size:.10f}".rstrip("0")
+    decimals = len(tick_str.split(".")[1]) if "." in tick_str else 0
+    ratio = price / tick_size
+    if direction == "DOWN":
+        ticks = math.floor(round(ratio, 8))
+    elif direction == "UP":
+        ticks = math.ceil(round(ratio, 8))
+    else:
+        ticks = round(ratio)
+    return round(ticks * tick_size, decimals)
+
+
+@dataclass
+class JevDynamicSLTPResult:
+    sl_price: float
+    tp_price: float
+    sl_anchor: str
+    tp_target_type: str
+    target_rr_multiple: float
+    sl_cushion_grade: float
+    realized_rr_ratio: float
+    confidence: float
+    latency_ms: float
+    raw_answers: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class JevDynamicTrailingResult:
+    action: str
+    candidate_sl_price: float
+    buffer_tightness: float
+    confidence: float
+    reason: str
+    latency_ms: float
+    raw_answers: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -43,6 +85,71 @@ class JevMistakeForensics:
     probabilities: Dict[str, float]
     was_preventable: float
     latency_ms: float
+
+
+@dataclass
+class JevRegimeResult:
+    market_regime: str
+    scalp_suitability: float
+    recommended_strategy: str
+    confidence: float
+    is_favorable: bool
+    latency_ms: float
+    raw_answers: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class JevRoutingResult:
+    order_type: str
+    execution_urgency: float
+    confidence: float
+    recommended_offset_ticks: int
+    reason: str
+    latency_ms: float
+    raw_answers: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class JevSMTResult:
+    smt_divergence_detected: float
+    alpha_leader: str
+    favored_asset: str
+    confidence: float
+    is_trap_warning: bool
+    reason: str
+    latency_ms: float
+    raw_answers: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class JevSizingResult:
+    conviction_multiplier: float
+    risk_tier: str
+    confidence: float
+    reason: str
+    latency_ms: float
+    raw_answers: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class JevScratchExitResult:
+    thesis_integrity: str
+    scratch_action: str
+    confidence: float
+    reason: str
+    should_scratch: bool
+    latency_ms: float
+    raw_answers: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class JevForensicsResult:
+    root_cause: str
+    pattern_tag: str
+    confidence: float
+    was_preventable: float
+    latency_ms: float
+    raw_answers: Dict[str, Any] = field(default_factory=dict)
 
 
 class JevClient:
@@ -512,3 +619,911 @@ class JevClient:
             was_preventable=was_preventable,
             latency_ms=self.last_latency_ms,
         )
+
+    # -----------------------------------------------------------------------
+    # 4. Dynamic SL & TP Resolution Protocol
+    # -----------------------------------------------------------------------
+
+    async def evaluate_dynamic_sl_tp(
+        self,
+        symbol: str,
+        direction: str,
+        entry_price: float,
+        atr: float,
+        technical_levels: Dict[str, Any],
+        max_loss_price_diff: Optional[float] = None,
+        tick_size: float = 0.1,
+    ) -> Optional[JevDynamicSLTPResult]:
+        """
+        Dynamically determine Stop Loss and Take Profit levels using Jev System One model
+        grounded in actual ICT technical market structure (Order Blocks, Swings, Sweeps, VAH/VAL),
+        strictly maintaining an institutional Risk:Reward ratio (>= min_risk_reward_ratio).
+        """
+        if not self.enabled or not getattr(self.config, "enable_dynamic_sl_tp", True):
+            return None
+
+        is_long = direction.upper() in ("LONG", "BUY")
+        atr_val = max(1.0, float(atr)) if atr and atr > 0 else (entry_price * 0.002)
+        tick_sz = float(tick_size) if tick_size and tick_size > 0 else 0.1
+
+        swing_low = technical_levels.get("swing_low")
+        swing_high = technical_levels.get("swing_high")
+        ob_bottom = technical_levels.get("ob_bottom")
+        ob_top = technical_levels.get("ob_top")
+        trap_wick_price = technical_levels.get("trap_wick_price")
+        vah = technical_levels.get("vah")
+        val = technical_levels.get("val")
+        pdh = technical_levels.get("pdh")
+        pdl = technical_levels.get("pdl")
+        nearest_res = technical_levels.get("nearest_resistance")
+        nearest_sup = technical_levels.get("nearest_support")
+
+        def _fmt(v: Any) -> str:
+            return f"${float(v):.2f}" if (v is not None and isinstance(v, (int, float)) and v > 0) else "None"
+
+        state = (
+            f"Trade Setup: Candidate {direction.upper()} on {symbol} at ${entry_price:.2f}. "
+            f"ATR: ${atr_val:.2f}. "
+            f"Technical Structure: "
+            f"Recent Swing Low: {_fmt(swing_low)}, Recent Swing High: {_fmt(swing_high)}. "
+            f"Order Block Zone: {_fmt(ob_bottom)} to {_fmt(ob_top)}. "
+            f"Liquidity Sweep Wick: {_fmt(trap_wick_price)}. "
+            f"Value Area: VAH={_fmt(vah)}, VAL={_fmt(val)}. "
+            f"HTF Levels: PDH={_fmt(pdh)}, PDL={_fmt(pdl)}. "
+            f"Nearest Levels: Support={_fmt(nearest_sup)}, Resistance={_fmt(nearest_res)}."
+        )
+
+        questions = {
+            "sl_anchor": {
+                "type": "choice",
+                "instructions": "What is the optimal structural anchor for the Stop Loss?",
+                "criteria": {
+                    "SWEEP_WICK": "Place tight sniper SL just below/above the liquidity sweep rejection wick",
+                    "ORDER_BLOCK": "Place SL behind the institutional order block boundary",
+                    "SWING_POINT": "Place SL behind the confirmed structural swing point",
+                    "VOLATILITY_ATR": "Place SL using volatility ATR buffer",
+                },
+            },
+            "sl_cushion": {
+                "type": "score",
+                "instructions": "Rate the market noise cushion from 0 (ultra-tight) to 4 (maximum breathing room)",
+                "criteria": [
+                    "Grade 0: Ultra-tight (0.1x ATR buffer beyond anchor - sniper scalp)",
+                    "Grade 1: Tight (0.25x ATR buffer beyond anchor)",
+                    "Grade 2: Moderate (0.4x ATR buffer beyond anchor)",
+                    "Grade 3: Wide (0.6x ATR buffer beyond anchor)",
+                    "Grade 4: Defensive (0.8x ATR buffer beyond anchor)",
+                ],
+            },
+            "tp_target_type": {
+                "type": "choice",
+                "instructions": "What is the primary high-probability Take Profit target level?",
+                "criteria": {
+                    "LIQUIDITY_POOL": "Target the opposing liquidity pool or session extreme sweep",
+                    "VALUE_AREA_EXTREME": "Target the Value Area High / Low range extreme",
+                    "MEASURED_EXTENSION": "Target standard expansion extension based on risk multiple",
+                },
+            },
+            "target_rr_multiple": {
+                "type": "score",
+                "instructions": "Rate the institutional reward expansion potential in terms of R-multiple (2.0R to 5.0R)",
+                "criteria": [
+                    "2.0R: Conservative scalp target into initial resistance/support",
+                    "2.5R: Standard high-probability ICT expansion target",
+                    "3.0R: Strong momentum trend continuation target",
+                    "4.0R: Multi-timeframe breakout extension",
+                    "5.0R: Major institutional runner",
+                ],
+            },
+        }
+
+        answers = await self._query_system_one(state, questions)
+        if not answers:
+            return None
+
+        # Parse answers
+        sl_ans = answers.get("sl_anchor", {})
+        sl_anchor = str(sl_ans.get("choice", "ORDER_BLOCK")).upper()
+        anchor_conf = float(sl_ans.get("confidence", 0.0))
+
+        cushion_ans = answers.get("sl_cushion", {})
+        cushion_score = float(cushion_ans.get("score", 2.0))
+
+        tp_ans = answers.get("tp_target_type", {})
+        tp_target_type = str(tp_ans.get("choice", "LIQUIDITY_POOL")).upper()
+
+        rr_ans = answers.get("target_rr_multiple", {})
+        rr_score = float(rr_ans.get("score", 1.0))  # default 1.0 -> 2.5R
+
+        # Map cushion score to ATR multiplier (0.1x to 0.8x ATR)
+        cushion_mult = 0.10 + (cushion_score / 4.0) * 0.70
+        cushion = cushion_mult * atr_val
+
+        # Map target R-multiple score (maps 0.0 -> 2.0R, 4.0 -> 5.0R)
+        min_rr = getattr(self.config, "min_risk_reward_ratio", 2.0)
+        target_rr = max(min_rr, 2.0 + (rr_score / 4.0) * 3.0)
+
+        # Compute raw SL
+        if is_long:
+            if sl_anchor == "SWEEP_WICK" and trap_wick_price and 0 < trap_wick_price < entry_price:
+                raw_sl = trap_wick_price - cushion
+            elif sl_anchor == "ORDER_BLOCK" and ob_bottom and 0 < ob_bottom < entry_price:
+                raw_sl = ob_bottom - cushion
+            elif sl_anchor == "SWING_POINT" and swing_low and 0 < swing_low < entry_price:
+                raw_sl = swing_low - cushion
+            else:
+                raw_sl = entry_price - (1.2 + (cushion_score / 4.0) * 0.8) * atr_val
+
+            # Capital Protection Ceiling: Ensure SL does not exceed max allowed margin loss
+            if max_loss_price_diff and max_loss_price_diff > 0:
+                min_safe_sl = entry_price - max_loss_price_diff
+                if raw_sl < min_safe_sl:
+                    raw_sl = min_safe_sl
+
+            risk = max(atr_val * 0.5, entry_price - raw_sl)
+
+            # Compute raw TP
+            structural_tp = None
+            if tp_target_type == "LIQUIDITY_POOL":
+                cand_res = nearest_res or pdh
+                if cand_res and cand_res > entry_price and (cand_res - entry_price) >= min_rr * risk:
+                    structural_tp = cand_res
+            elif tp_target_type == "VALUE_AREA_EXTREME":
+                if vah and vah > entry_price and (vah - entry_price) >= min_rr * risk:
+                    structural_tp = vah
+
+            if structural_tp is not None:
+                raw_tp = structural_tp
+            else:
+                raw_tp = entry_price + (target_rr * risk)
+
+            # Strict R:R ratio guarantee
+            reward = raw_tp - entry_price
+            if reward < min_rr * risk:
+                raw_tp = entry_price + (min_rr * risk)
+                reward = raw_tp - entry_price
+
+            realized_rr = reward / risk if risk > 0 else min_rr
+
+            sl_price = _round_to_tick(raw_sl, tick_sz, direction="DOWN")
+            tp_price = _round_to_tick(raw_tp, tick_sz, direction="UP")
+
+        else:  # SHORT
+            if sl_anchor == "SWEEP_WICK" and trap_wick_price and trap_wick_price > entry_price:
+                raw_sl = trap_wick_price + cushion
+            elif sl_anchor == "ORDER_BLOCK" and ob_top and ob_top > entry_price:
+                raw_sl = ob_top + cushion
+            elif sl_anchor == "SWING_POINT" and swing_high and swing_high > entry_price:
+                raw_sl = swing_high + cushion
+            else:
+                raw_sl = entry_price + (1.2 + (cushion_score / 4.0) * 0.8) * atr_val
+
+            if max_loss_price_diff and max_loss_price_diff > 0:
+                max_safe_sl = entry_price + max_loss_price_diff
+                if raw_sl > max_safe_sl:
+                    raw_sl = max_safe_sl
+
+            risk = max(atr_val * 0.5, raw_sl - entry_price)
+
+            structural_tp = None
+            if tp_target_type == "LIQUIDITY_POOL":
+                cand_sup = nearest_sup or pdl
+                if cand_sup and 0 < cand_sup < entry_price and (entry_price - cand_sup) >= min_rr * risk:
+                    structural_tp = cand_sup
+            elif tp_target_type == "VALUE_AREA_EXTREME":
+                if val and 0 < val < entry_price and (entry_price - val) >= min_rr * risk:
+                    structural_tp = val
+
+            if structural_tp is not None:
+                raw_tp = structural_tp
+            else:
+                raw_tp = max(0.0, entry_price - (target_rr * risk))
+
+            reward = entry_price - raw_tp
+            if reward < min_rr * risk:
+                raw_tp = max(0.0, entry_price - (min_rr * risk))
+                reward = entry_price - raw_tp
+
+            realized_rr = reward / risk if risk > 0 else min_rr
+
+            sl_price = _round_to_tick(raw_sl, tick_sz, direction="UP")
+            tp_price = _round_to_tick(raw_tp, tick_sz, direction="DOWN")
+
+        logger.info(
+            f"[JEV DYNAMIC SL/TP] {symbol} {direction}: SL=${sl_price:,.2f} ({sl_anchor}) | "
+            f"TP=${tp_price:,.2f} ({tp_target_type}) | Realized R:R={realized_rr:.2f}R (Target={target_rr:.1f}R, Latency={self.last_latency_ms:.0f}ms)"
+        )
+
+        return JevDynamicSLTPResult(
+            sl_price=sl_price,
+            tp_price=tp_price,
+            sl_anchor=sl_anchor,
+            tp_target_type=tp_target_type,
+            target_rr_multiple=target_rr,
+            sl_cushion_grade=cushion_score,
+            realized_rr_ratio=realized_rr,
+            confidence=anchor_conf,
+            latency_ms=self.last_latency_ms,
+            raw_answers=answers,
+        )
+
+    # -----------------------------------------------------------------------
+    # 5. Dynamic Trailing Stop Loss Protocol
+    # -----------------------------------------------------------------------
+
+    async def evaluate_dynamic_trailing_stop(
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        current_price: float,
+        current_sl: float,
+        initial_sl: float,
+        unrealized_pnl: float,
+        duration_seconds: float,
+        atr: float,
+        technical_levels: Dict[str, Any],
+        tick_size: float = 0.1,
+    ) -> Optional[JevDynamicTrailingResult]:
+        """
+        Dynamically evaluate trailing stop loss action using Jev System One model.
+        Enforces Ratchet Invariant: Trailing stop loss can ONLY move in favor of position.
+        """
+        if not self.enabled or not getattr(self.config, "enable_dynamic_trailing", True):
+            return None
+
+        is_long = side.upper() in ("LONG", "BUY")
+        tick_sz = float(tick_size) if tick_size and tick_size > 0 else 0.1
+        atr_val = max(1.0, float(atr)) if atr and atr > 0 else (entry_price * 0.002)
+
+        initial_risk = abs(entry_price - initial_sl) if initial_sl and initial_sl > 0 else (entry_price * 0.01)
+        r_profit = (
+            ((current_price - entry_price) / initial_risk)
+            if is_long
+            else ((entry_price - current_price) / initial_risk)
+        )
+
+        new_swing_low = technical_levels.get("swing_low")
+        new_swing_high = technical_levels.get("swing_high")
+        rsi = technical_levels.get("rsi", 50.0)
+
+        def _fmt(v: Any) -> str:
+            return f"${float(v):.2f}" if (v is not None and isinstance(v, (int, float)) and v > 0) else "None"
+
+        state = (
+            f"Active Position: {side.upper()} {symbol}. "
+            f"Entry: ${entry_price:.2f}, Current Price: ${current_price:.2f}. "
+            f"Initial SL: ${initial_sl:.2f}, Current SL: ${current_sl:.2f}. "
+            f"Initial Risk: ${initial_risk:.2f}. Unrealized Profit: ${unrealized_pnl:+.2f} ({r_profit:+.2f}R). "
+            f"Holding Duration: {duration_seconds:.0f} seconds. "
+            f"Recent 1m Swing Low: {_fmt(new_swing_low)}, Recent 1m Swing High: {_fmt(new_swing_high)}. "
+            f"RSI: {rsi:.1f}, ATR: ${atr_val:.2f}."
+        )
+
+        questions = {
+            "trailing_action": {
+                "type": "choice",
+                "instructions": "What is the optimal dynamic trailing stop loss action?",
+                "criteria": {
+                    "HOLD_INITIAL": "Keep current stop loss to avoid premature shakeout",
+                    "LOCK_BREAKEVEN": "Move stop loss to entry price + fee buffer to ensure zero loss",
+                    "TRAIL_RECENT_SWING": "Trail stop loss behind the newly formed 1m structural swing point",
+                    "AGGRESSIVE_PROFIT_LOCK": "Aggressively lock in maximum profit close to current price",
+                },
+            },
+            "buffer_tightness": {
+                "type": "score",
+                "instructions": "Rate the trailing buffer tightness from 0 (loose/breathing room) to 4 (maximum profit lock)",
+                "criteria": [
+                    "Grade 0: Wide buffer, allowing deep healthy pullbacks (0.6x ATR)",
+                    "Grade 1: Moderate buffer (0.4x ATR)",
+                    "Grade 2: Standard buffer (0.25x ATR)",
+                    "Grade 3: Tight buffer (0.15x ATR)",
+                    "Grade 4: Maximum lock, right below current price",
+                ],
+            },
+        }
+
+        answers = await self._query_system_one(state, questions)
+        if not answers:
+            return None
+
+        act_ans = answers.get("trailing_action", {})
+        action = str(act_ans.get("choice", "HOLD_INITIAL")).upper()
+        confidence = float(act_ans.get("confidence", 0.0))
+
+        buf_ans = answers.get("buffer_tightness", {})
+        buf_score = float(buf_ans.get("score", 2.0))
+
+        # Calculate buffer
+        buffer_mult = 0.15 + ((4.0 - buf_score) / 4.0) * 0.45  # 0.15x to 0.60x ATR
+        trail_buffer = buffer_mult * atr_val
+
+        candidate_sl = current_sl
+
+        if action == "HOLD_INITIAL":
+            candidate_sl = current_sl
+
+        elif action == "LOCK_BREAKEVEN":
+            if is_long:
+                candidate_sl = entry_price * 1.001
+            else:
+                candidate_sl = entry_price * 0.999
+
+        elif action == "TRAIL_RECENT_SWING":
+            if is_long and new_swing_low and new_swing_low > 0:
+                candidate_sl = new_swing_low - trail_buffer
+            elif not is_long and new_swing_high and new_swing_high > 0:
+                candidate_sl = new_swing_high + trail_buffer
+            else:
+                candidate_sl = current_sl
+
+        elif action == "AGGRESSIVE_PROFIT_LOCK":
+            if is_long:
+                candidate_sl = current_price - (0.5 * atr_val)
+            else:
+                candidate_sl = current_price + (0.5 * atr_val)
+
+        # Enforce Ratchet Invariant: Trailing SL can NEVER move backwards!
+        if is_long:
+            candidate_sl = _round_to_tick(candidate_sl, tick_sz, direction="DOWN")
+            if candidate_sl <= current_sl:
+                candidate_sl = current_sl
+                reason = f"Ratchet held: Candidate ${candidate_sl:,.2f} <= current SL ${current_sl:,.2f}"
+            else:
+                reason = f"Ratchet moved: SL trailed to ${candidate_sl:,.2f} via {action} (Profit={r_profit:+.2f}R)"
+        else:
+            candidate_sl = _round_to_tick(candidate_sl, tick_sz, direction="UP")
+            if current_sl > 0 and candidate_sl >= current_sl:
+                candidate_sl = current_sl
+                reason = f"Ratchet held: Candidate ${candidate_sl:,.2f} >= current SL ${current_sl:,.2f}"
+            else:
+                reason = f"Ratchet moved: SL trailed to ${candidate_sl:,.2f} via {action} (Profit={r_profit:+.2f}R)"
+
+        logger.info(f"[JEV DYNAMIC TRAILING] {symbol} {side}: {reason}")
+
+        return JevDynamicTrailingResult(
+            action=action,
+            candidate_sl_price=candidate_sl,
+            buffer_tightness=buf_score,
+            confidence=confidence,
+            reason=reason,
+            latency_ms=self.last_latency_ms,
+            raw_answers=answers,
+        )
+
+    async def evaluate_market_regime(
+        self,
+        atr_15m: float,
+        atr_1h: float,
+        bb_bandwidth: float = 0.02,
+        rel_vol_15m: float = 1.0,
+        session_zone: str = "NORMAL",
+        squeeze_state: str = "NONE",
+    ) -> JevRegimeResult:
+        """
+        Evaluate high-level crypto market regime and scalp suitability via Jev System One.
+        Runs periodically (e.g. every 15 min) before scanning to avoid low-volatility chop.
+        """
+        atr_ratio = (atr_15m / atr_1h) if atr_1h > 0 else 1.0
+
+        if not self.enabled:
+            is_fav = atr_ratio >= 0.70 and rel_vol_15m >= 0.70
+            regime = "TRENDING_EXPANSION" if is_fav else "DEAD_CHOP"
+            strat = "MOMENTUM_BREAKOUT" if is_fav else "SIT_ON_HANDS"
+            return JevRegimeResult(
+                market_regime=regime,
+                scalp_suitability=0.80 if is_fav else 0.30,
+                recommended_strategy=strat,
+                confidence=0.60,
+                is_favorable=is_fav,
+                latency_ms=0.0,
+            )
+
+        state = (
+            f"Crypto Scalping Market Regime Assessment. "
+            f"15m ATR={atr_15m:.2f}, 1h ATR={atr_1h:.2f}, Volatility Ratio (15m/1h)={atr_ratio:.2f}. "
+            f"Bollinger Bandwidth={bb_bandwidth:.4f}, Relative Volume={rel_vol_15m:.2f}x. "
+            f"Session Timing={session_zone}, Squeeze State={squeeze_state}."
+        )
+
+        questions = {
+            "market_regime": {
+                "type": "choice",
+                "instructions": "What is the active structural market regime across crypto?",
+                "criteria": {
+                    "TRENDING_EXPANSION": "Strong directional impulse with high relative volume expansion",
+                    "COMPRESSION_SQUEEZE": "Low volatility price compression preceding violent breakout",
+                    "MANIPULATION_SWEEP": "Erratic liquidity wick sweeps (Asian/London open stop runs)",
+                    "DEAD_CHOP": "Low volume sideways drift with zero institutional follow-through",
+                },
+            },
+            "scalp_suitability": {
+                "type": "noul",
+                "instructions": (
+                    "Is the current regime suitable for high-probability 25x scalping without "
+                    "excessive maker/taker fee drag or choppy whipsaws?"
+                ),
+            },
+            "recommended_strategy": {
+                "type": "choice",
+                "instructions": "Which trading posture offers the highest mathematical expectancy?",
+                "criteria": {
+                    "MOMENTUM_BREAKOUT": "Trade momentum breakouts with directional volume",
+                    "ORDER_BLOCK_PULLBACK": "Trade passive limit order pullbacks into support/resistance",
+                    "SIT_ON_HANDS": "Do not trade; stay 100% in cash to preserve capital",
+                },
+            },
+        }
+
+        answers = await self._query_system_one(state, questions)
+        if not answers:
+            is_fav = atr_ratio >= 0.70
+            return JevRegimeResult(
+                market_regime="TRENDING_EXPANSION" if is_fav else "DEAD_CHOP",
+                scalp_suitability=0.75 if is_fav else 0.35,
+                recommended_strategy="MOMENTUM_BREAKOUT" if is_fav else "SIT_ON_HANDS",
+                confidence=0.50,
+                is_favorable=is_fav,
+                latency_ms=self.last_latency_ms,
+            )
+
+        regime = str(answers.get("market_regime", {}).get("choice", "TRENDING_EXPANSION")).upper()
+        suitability = float(answers.get("scalp_suitability", {}).get("noul", 0.70))
+        strategy = str(answers.get("recommended_strategy", {}).get("choice", "MOMENTUM_BREAKOUT")).upper()
+        conf = float(answers.get("market_regime", {}).get("confidence", 0.80))
+        is_fav = suitability >= 0.40 and regime != "DEAD_CHOP"
+
+        logger.info(
+            f"[JEV REGIME ARBITER] Regime={regime}, Suitability={suitability:.2f}, "
+            f"Strategy={strategy}, Favorable={is_fav} ({self.last_latency_ms:.0f}ms)"
+        )
+
+        return JevRegimeResult(
+            market_regime=regime,
+            scalp_suitability=suitability,
+            recommended_strategy=strategy,
+            confidence=conf,
+            is_favorable=is_fav,
+            latency_ms=self.last_latency_ms,
+            raw_answers=answers,
+        )
+
+    async def evaluate_execution_routing(
+        self,
+        symbol: str,
+        side: str,
+        spread_bps: float,
+        book_imbalance: float = 1.0,
+        tape_velocity_1m: float = 1.0,
+        distance_to_ob_pct: float = 0.0,
+    ) -> JevRoutingResult:
+        """
+        Evaluate fee-optimized execution routing via Jev System One.
+        Prioritizes Maker Post-Only limit orders (0.02% fee) over Taker market orders (0.05%).
+        """
+        if not self.enabled:
+            is_urgent = tape_velocity_1m >= 3.5 or spread_bps > 2.5
+            return JevRoutingResult(
+                order_type="INSTANT_MARKET_TAKER" if is_urgent else "MAKER_POST_ONLY",
+                execution_urgency=0.80 if is_urgent else 0.20,
+                confidence=0.70,
+                recommended_offset_ticks=0,
+                reason="Default fee-optimized local routing",
+                latency_ms=0.0,
+            )
+
+        state = (
+            f"Symbol: {symbol}, Candidate Entry Side: {side}. "
+            f"Orderbook Bid-Ask Spread: {spread_bps:.2f} bps. "
+            f"Book Imbalance Ratio (Bids/Asks): {book_imbalance:.2f}. "
+            f"1m Tape Velocity: {tape_velocity_1m:.1f} ticks/sec. "
+            f"Distance to Order Block: {distance_to_ob_pct:.2f}%."
+        )
+
+        questions = {
+            "execution_urgency": {
+                "type": "noul",
+                "instructions": (
+                    "Is price about to violently run so rapidly that waiting for a resting limit "
+                    "order fill will cause slippage or a missed breakout?"
+                ),
+            },
+            "order_type": {
+                "type": "choice",
+                "instructions": "Which order routing maximizes net edge after exchange fees?",
+                "criteria": {
+                    "MAKER_POST_ONLY": "Passive resting limit at bid/ask (0.02% maker fee, 60% fee savings)",
+                    "CHASE_LIMIT": "Dynamic limit placed 1 tick into the book with brief stepping",
+                    "INSTANT_MARKET_TAKER": "Immediate taker market order (0.05% taker fee) for urgent breakout",
+                },
+            },
+        }
+
+        answers = await self._query_system_one(state, questions)
+        if not answers:
+            is_urgent = tape_velocity_1m >= 3.5
+            return JevRoutingResult(
+                order_type="INSTANT_MARKET_TAKER" if is_urgent else "MAKER_POST_ONLY",
+                execution_urgency=0.80 if is_urgent else 0.20,
+                confidence=0.60,
+                recommended_offset_ticks=0,
+                reason="Fallback fee-optimized routing",
+                latency_ms=self.last_latency_ms,
+            )
+
+        urgency = float(answers.get("execution_urgency", {}).get("noul", 0.30))
+        order_type = str(answers.get("order_type", {}).get("choice", "MAKER_POST_ONLY")).upper()
+        conf = float(answers.get("order_type", {}).get("confidence", 0.80))
+        offset = -1 if order_type == "CHASE_LIMIT" else 0
+        reason = f"Jev Routing: {order_type} (Urgency={urgency:.2f})"
+
+        logger.info(f"[JEV SMART ROUTING] {symbol} {side}: {reason} ({self.last_latency_ms:.0f}ms)")
+
+        return JevRoutingResult(
+            order_type=order_type,
+            execution_urgency=urgency,
+            confidence=conf,
+            recommended_offset_ticks=offset,
+            reason=reason,
+            latency_ms=self.last_latency_ms,
+            raw_answers=answers,
+        )
+
+    async def evaluate_cross_asset_smt(
+        self,
+        btc_delta_5m: float,
+        eth_delta_5m: float,
+        btc_bias: str,
+        eth_bias: str,
+        btc_bos: bool,
+        eth_bos: bool,
+        eth_btc_momentum: str = "NEUTRAL",
+    ) -> JevSMTResult:
+        """
+        Evaluate ICT Smart Money Technique (SMT) cross-asset divergence between BTC and ETH.
+        Detects correlation cracks to avoid institutional traps and pick the alpha leader.
+        """
+        if not self.enabled:
+            is_divergent = (btc_delta_5m * eth_delta_5m < 0) and abs(btc_delta_5m - eth_delta_5m) > 0.5
+            leader = "BTC_LEADS" if abs(btc_delta_5m) >= abs(eth_delta_5m) else "ETH_LEADS"
+            return JevSMTResult(
+                smt_divergence_detected=0.75 if is_divergent else 0.10,
+                alpha_leader=leader,
+                favored_asset="AVOID_BOTH" if is_divergent else ("TRADE_BTC" if leader == "BTC_LEADS" else "TRADE_ETH"),
+                confidence=0.60,
+                is_trap_warning=is_divergent,
+                reason="Local correlation check",
+                latency_ms=0.0,
+            )
+
+        state = (
+            f"Cross-Asset ICT SMT Divergence Analysis: BTCUSD vs ETHUSD. "
+            f"BTC 5m Delta: {btc_delta_5m:+.2f}%, 15m Bias: {btc_bias}, 5m BOS={btc_bos}. "
+            f"ETH 5m Delta: {eth_delta_5m:+.2f}%, 15m Bias: {eth_bias}, 5m BOS={eth_bos}. "
+            f"ETH/BTC Ratio Momentum: {eth_btc_momentum}."
+        )
+
+        questions = {
+            "smt_divergence_detected": {
+                "type": "noul",
+                "instructions": (
+                    "Is there a Smart Money Technique (SMT) divergence or crack in correlation "
+                    "(e.g. one asset making higher high while other fails) indicating an institutional trap?"
+                ),
+            },
+            "alpha_leader": {
+                "type": "choice",
+                "instructions": "Which asset exhibits true institutional relative strength / leadership?",
+                "criteria": {
+                    "BTC_LEADS": "BTC is the dominant trend driver with cleaner momentum and order flow",
+                    "ETH_LEADS": "ETH is leading price action with higher relative beta and volume",
+                    "NEUTRAL_SYNC": "Both assets are moving synchronously with tight correlation",
+                },
+            },
+            "favored_asset": {
+                "type": "choice",
+                "instructions": "Where should scalping capital be deployed?",
+                "criteria": {
+                    "TRADE_BTC": "Focus exclusively on BTCUSD",
+                    "TRADE_ETH": "Focus exclusively on ETHUSD",
+                    "AVOID_BOTH": "High SMT trap risk; avoid both assets until correlation clarifies",
+                },
+            },
+        }
+
+        answers = await self._query_system_one(state, questions)
+        if not answers:
+            is_div = btc_delta_5m * eth_delta_5m < 0
+            return JevSMTResult(
+                smt_divergence_detected=0.70 if is_div else 0.15,
+                alpha_leader="BTC_LEADS" if abs(btc_delta_5m) >= abs(eth_delta_5m) else "ETH_LEADS",
+                favored_asset="AVOID_BOTH" if is_div else "TRADE_BTC",
+                confidence=0.50,
+                is_trap_warning=is_div,
+                reason="Fallback SMT correlation check",
+                latency_ms=self.last_latency_ms,
+            )
+
+        smt_div = float(answers.get("smt_divergence_detected", {}).get("noul", 0.0))
+        leader = str(answers.get("alpha_leader", {}).get("choice", "NEUTRAL_SYNC")).upper()
+        favored = str(answers.get("favored_asset", {}).get("choice", "TRADE_BTC")).upper()
+        conf = float(answers.get("alpha_leader", {}).get("confidence", 0.80))
+        is_trap = smt_div >= 0.65
+        reason = f"SMT Div={smt_div:.2f}, Leader={leader}, Favored={favored}"
+
+        logger.info(f"[JEV SMT ARBITER] {reason} (TrapWarning={is_trap})")
+
+        return JevSMTResult(
+            smt_divergence_detected=smt_div,
+            alpha_leader=leader,
+            favored_asset=favored,
+            confidence=conf,
+            is_trap_warning=is_trap,
+            reason=reason,
+            latency_ms=self.last_latency_ms,
+            raw_answers=answers,
+        )
+
+    async def evaluate_conviction_sizing(
+        self,
+        symbol: str,
+        setup_grade: float,
+        dir_conf: float = 0.80,
+        onnx_conf: float = 0.70,
+        pattern_win_rate: float = 0.60,
+        pattern_trades: int = 10,
+        drawdown_pct: float = 0.0,
+    ) -> JevSizingResult:
+        """
+        Dynamically scale position sizing from 0.5x to 1.5x based on setup conviction.
+        A+ setups (Grade 4.0) receive full size; borderline Grade 2.0 receives conservative half-size.
+        """
+        if not self.enabled:
+            mult = 1.5 if setup_grade >= 3.5 else (0.5 if setup_grade < 2.2 else 1.0)
+            tier = "AGGRESSIVE_HIGH_CONVICTION" if mult > 1.2 else ("PROBE_HALF_SIZE" if mult < 0.8 else "STANDARD_FULL_SIZE")
+            return JevSizingResult(
+                conviction_multiplier=mult,
+                risk_tier=tier,
+                confidence=0.70,
+                reason="Local conviction sizing",
+                latency_ms=0.0,
+            )
+
+        state = (
+            f"Symbol: {symbol}, Setup Grade: {setup_grade:.2f}/4.0, Direction Confidence: {dir_conf*100:.0f}%. "
+            f"ONNX ML Confidence: {onnx_conf*100:.1f}%. "
+            f"Historical Pattern Win Rate: {pattern_win_rate*100:.1f}% ({pattern_trades} trades). "
+            f"Current Daily Drawdown: {drawdown_pct:.1f}% of daily limit."
+        )
+
+        questions = {
+            "conviction_multiplier": {
+                "type": "score",
+                "instructions": "Rate optimal position scale multiplier from 0.5 to 1.5 based on setup edge",
+                "criteria": [
+                    "0.5: Low conviction, cautious probe size (borderline edge)",
+                    "1.0: Standard baseline size (solid multi-timeframe confluence)",
+                    "1.5: High conviction A+ institutional runner (exceptional confluence)",
+                ],
+            },
+            "risk_tier": {
+                "type": "choice",
+                "instructions": "What risk tier should be assigned to this order?",
+                "criteria": {
+                    "PROBE_HALF_SIZE": "0.5x cautious allocation",
+                    "STANDARD_FULL_SIZE": "1.0x standard risk allocation",
+                    "AGGRESSIVE_HIGH_CONVICTION": "1.25x-1.5x high conviction runner allocation",
+                },
+            },
+        }
+
+        answers = await self._query_system_one(state, questions)
+        if not answers:
+            mult = 1.25 if setup_grade >= 3.2 else (0.6 if setup_grade < 2.0 else 1.0)
+            return JevSizingResult(
+                conviction_multiplier=mult,
+                risk_tier="STANDARD_FULL_SIZE",
+                confidence=0.60,
+                reason="Fallback conviction sizing",
+                latency_ms=self.last_latency_ms,
+            )
+
+        raw_score = float(answers.get("conviction_multiplier", {}).get("score", 1.0))
+        # Ensure clamped strictly within [0.5, 1.5]
+        mult = max(0.5, min(1.5, raw_score))
+        tier = str(answers.get("risk_tier", {}).get("choice", "STANDARD_FULL_SIZE")).upper()
+        conf = float(answers.get("risk_tier", {}).get("confidence", 0.80))
+        reason = f"Conviction Sizing: {mult:.2f}x ({tier})"
+
+        logger.info(f"[JEV CONVICTION SIZING] {symbol}: {reason} ({self.last_latency_ms:.0f}ms)")
+
+        return JevSizingResult(
+            conviction_multiplier=mult,
+            risk_tier=tier,
+            confidence=conf,
+            reason=reason,
+            latency_ms=self.last_latency_ms,
+            raw_answers=answers,
+        )
+
+    async def evaluate_scratch_exit(
+        self,
+        symbol: str,
+        side: str,
+        seconds_held: float,
+        unrealized_pnl_pct: float,
+        delta_absorbed_str: str = "NORMAL",
+        candle_stall_reason: str = "NONE",
+    ) -> JevScratchExitResult:
+        """
+        Evaluate pre-emptive scratch exits in the active position monitoring loop.
+        Exits stalled or absorbed positions at flat/breakeven before dropping to full -3% SL.
+        """
+        if not self.enabled:
+            should_scratch = seconds_held >= 180 and unrealized_pnl_pct <= -0.5 and "lower" in candle_stall_reason.lower()
+            return JevScratchExitResult(
+                thesis_integrity="THESIS_INVALIDATED" if should_scratch else "MOMENTUM_EXPANDING",
+                scratch_action="EMERGENCY_SCRATCH_EXIT" if should_scratch else "HOLD",
+                confidence=0.70,
+                reason="Local scratch heuristic",
+                should_scratch=should_scratch,
+                latency_ms=0.0,
+            )
+
+        state = (
+            f"Active Position Trade Integrity Monitor: {symbol} {side}. "
+            f"Holding Duration: {seconds_held:.0f}s. "
+            f"Unrealized PnL: {unrealized_pnl_pct:+.2f}%. "
+            f"Order Flow Delta Absorbed: {delta_absorbed_str}. "
+            f"Candle Momentum: {candle_stall_reason}."
+        )
+
+        questions = {
+            "thesis_integrity": {
+                "type": "choice",
+                "instructions": "What is the structural health of the active trade thesis?",
+                "criteria": {
+                    "MOMENTUM_EXPANDING": "Trade running in favor; momentum expanding cleanly toward TP",
+                    "HEALTHY_PULLBACK": "Normal pullback retest; thesis remains fully intact",
+                    "ICEBERG_ABSORPTION": "Opposing limit orders absorbing momentum; trade stalled",
+                    "THESIS_INVALIDATED": "Price action broken; trade setup has completely failed",
+                },
+            },
+            "scratch_action": {
+                "type": "choice",
+                "instructions": "What immediate execution action should be taken?",
+                "criteria": {
+                    "HOLD": "Let trade develop with standard dynamic trailing stop",
+                    "TIGHTEN_SL_TO_BREAKEVEN": "Immediately tighten stop loss to breakeven",
+                    "EMERGENCY_SCRATCH_EXIT": "Close immediately at market/flat to prevent -3% loss",
+                },
+            },
+        }
+
+        answers = await self._query_system_one(state, questions)
+        if not answers:
+            should_sc = seconds_held >= 180 and unrealized_pnl_pct <= -1.0
+            return JevScratchExitResult(
+                thesis_integrity="THESIS_INVALIDATED" if should_sc else "MOMENTUM_EXPANDING",
+                scratch_action="EMERGENCY_SCRATCH_EXIT" if should_sc else "HOLD",
+                confidence=0.60,
+                reason="Fallback scratch check",
+                should_scratch=should_sc,
+                latency_ms=self.last_latency_ms,
+            )
+
+        integrity = str(answers.get("thesis_integrity", {}).get("choice", "MOMENTUM_EXPANDING")).upper()
+        action = str(answers.get("scratch_action", {}).get("choice", "HOLD")).upper()
+        conf = float(answers.get("scratch_action", {}).get("confidence", 0.80))
+        should_sc = action == "EMERGENCY_SCRATCH_EXIT"
+        reason = f"Jev Scratch: {action} (Integrity={integrity})"
+
+        if should_sc:
+            logger.warning(f"[JEV PRE-EMPTIVE SCRATCH] {symbol} {side}: {reason} ({self.last_latency_ms:.0f}ms)")
+        else:
+            logger.debug(f"[JEV POSITION HEALTH] {symbol} {side}: {reason}")
+
+        return JevScratchExitResult(
+            thesis_integrity=integrity,
+            scratch_action=action,
+            confidence=conf,
+            reason=reason,
+            should_scratch=should_sc,
+            latency_ms=self.last_latency_ms,
+            raw_answers=answers,
+        )
+
+    async def evaluate_post_trade_forensics(
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        exit_price: float,
+        pnl_pct: float,
+        holding_time_sec: float,
+        exit_reason: str,
+        mfe_pct: float = 0.0,
+        mae_pct: float = 0.0,
+    ) -> JevForensicsResult:
+        """
+        Evaluate post-trade forensics via Jev System One.
+        Auto-diagnoses trade root causes and enriches local pattern memory files.
+        """
+        if not self.enabled:
+            rc = "CLEAN_RUNNER" if pnl_pct > 0 else "FAILED_BREAKOUT"
+            tag = "GOLDEN_DISPLACEMENT" if pnl_pct > 0 else "TOXIC_CHOP"
+            return JevForensicsResult(
+                root_cause=rc,
+                pattern_tag=tag,
+                confidence=0.70,
+                was_preventable=0.20 if pnl_pct > 0 else 0.80,
+                latency_ms=0.0,
+            )
+
+        state = (
+            f"Post-Trade Forensic Reflexion: {symbol} {side}. "
+            f"Entry: ${entry_price:,.2f}, Exit: ${exit_price:,.2f}, Realized PnL: {pnl_pct:+.2f}%. "
+            f"Holding Time: {holding_time_sec:.0f}s. Exit Reason: {exit_reason}. "
+            f"Max Favorable Excursion (MFE): +{mfe_pct:.2f}%, Max Adverse Excursion (MAE): -{mae_pct:.2f}%."
+        )
+
+        questions = {
+            "root_cause": {
+                "type": "choice",
+                "instructions": "What was the primary root cause of the trade outcome?",
+                "criteria": {
+                    "CLEAN_RUNNER": "Setup expanded cleanly to dynamic TP with strong momentum",
+                    "SLIPPAGE_DRAG": "Exchange fees, spread, or slippage eroded trade edge",
+                    "VOLATILITY_SPIKE": "Whipped out by sudden volatility wick before resuming",
+                    "FAILED_BREAKOUT": "Breakout had no institutional follow-through and reversed",
+                    "PREMATURE_PANIC": "Exited trade too early before the planned move completed",
+                },
+            },
+            "pattern_tag": {
+                "type": "choice",
+                "instructions": "How should this market structure snapshot be tagged in pattern memory?",
+                "criteria": {
+                    "GOLDEN_DISPLACEMENT": "High-conviction institutional pattern to seek in future",
+                    "TOXIC_CHOP": "Low-liquidity erratic trap pattern to block in future",
+                    "LIQUIDITY_TRAP": "Stop-hunt or retail liquidity sweep trap",
+                    "SMT_TRAP": "Failed due to cross-asset divergence between BTC and ETH",
+                },
+            },
+            "was_preventable": {
+                "type": "noul",
+                "instructions": "Could this loss have been prevented with stricter pre-trade confluence gating?",
+            },
+        }
+
+        answers = await self._query_system_one(state, questions)
+        if not answers:
+            rc = "CLEAN_RUNNER" if pnl_pct > 0 else "FAILED_BREAKOUT"
+            tag = "GOLDEN_DISPLACEMENT" if pnl_pct > 0 else "TOXIC_CHOP"
+            return JevForensicsResult(
+                root_cause=rc,
+                pattern_tag=tag,
+                confidence=0.60,
+                was_preventable=0.50,
+                latency_ms=self.last_latency_ms,
+            )
+
+        root_cause = str(answers.get("root_cause", {}).get("choice", "FAILED_BREAKOUT")).upper()
+        pattern_tag = str(answers.get("pattern_tag", {}).get("choice", "TOXIC_CHOP")).upper()
+        preventable = float(answers.get("was_preventable", {}).get("noul", 0.50))
+        conf = float(answers.get("root_cause", {}).get("confidence", 0.80))
+
+        logger.info(
+            f"[JEV FORENSICS] {symbol} {side} ({pnl_pct:+.2f}%): RootCause={root_cause}, "
+            f"Tag={pattern_tag}, Preventable={preventable:.2f} ({self.last_latency_ms:.0f}ms)"
+        )
+
+        return JevForensicsResult(
+            root_cause=root_cause,
+            pattern_tag=pattern_tag,
+            confidence=conf,
+            was_preventable=preventable,
+            latency_ms=self.last_latency_ms,
+            raw_answers=answers,
+        )
+

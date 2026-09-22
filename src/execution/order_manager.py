@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import time
 from enum import Enum
 from dataclasses import dataclass
@@ -36,6 +37,13 @@ class ActiveOrder:
     setup_type: str = "NONE"
     execution_routing: str = "MARKET_MOMENTUM"
     entry_fingerprint: Optional[Any] = None
+    sl_anchor: Optional[str] = "STATIC"
+    tp_target_type: Optional[str] = "STATIC"
+    target_rr: Optional[float] = 2.0
+    realized_rr: Optional[float] = 2.0
+    cushion_grade: Optional[float] = None
+    conviction_multiplier: float = 1.0
+    jev_metadata: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         if self.created_at == 0.0:
@@ -123,6 +131,7 @@ class OrderManager:
         structural_target_tp: Optional[float] = None,
         setup_type: str = "NONE",
         fingerprint: Optional[Any] = None,
+        technical_levels: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Optional[Dict[str, Any]]:
         if not client_order_id:
@@ -217,13 +226,24 @@ class OrderManager:
             balances = await self.delta_client.get_wallet_balances()
             equity = float(balances.get("equity", 10000.0 if not self.delta_client.live_trading else 0.0))
 
+        conviction_mult = float(kwargs.get("conviction_multiplier", 1.0))
+
         if size is None:
-            computed_size, computed_margin, computed_notional = self.risk_manager.calculate_position_size(
-                equity=equity,
-                price=price,
-                leverage=int(leverage),
-                contract_value=contract_val,
-            )
+            try:
+                computed_size, computed_margin, computed_notional = self.risk_manager.calculate_position_size(
+                    equity=equity,
+                    price=price,
+                    leverage=int(leverage),
+                    contract_value=contract_val,
+                    conviction_multiplier=conviction_mult,
+                )
+            except TypeError:
+                computed_size, computed_margin, computed_notional = self.risk_manager.calculate_position_size(
+                    equity=equity,
+                    price=price,
+                    leverage=int(leverage),
+                    contract_value=contract_val,
+                )
             if computed_size > 0:
                 size = float(computed_size)
                 margin = computed_margin
@@ -240,22 +260,58 @@ class OrderManager:
         # Step 5: Liquidation distance
         liquidation_distance = price / leverage
 
-        # Step 6: Calculate SL/TP with tick_size rounding, optional structural target, and sniper trap wick
-        calc_sl, calc_tp = self.risk_manager.calculate_sl_tp(
-            side=side,
-            entry_price=price,
-            margin=margin,
-            leverage=int(leverage),
-            contract_value=contract_val,
-            size=int(size) if size >= 1 else 1,
-            atr=atr if atr is not None else 100.0,
-            tick_size=tick_size,
-            structural_target=structural_target_tp,
-            setup_type=setup_type,
-            trap_wick_price=kwargs.get("trap_wick_price", None),
-        )
-        final_sl = round_to_tick(sl_price if sl_price is not None else calc_sl, tick_size)
-        final_tp = round_to_tick(tp_price if tp_price is not None else calc_tp, tick_size)
+        # Step 6: Calculate SL/TP dynamically with Jev AI / institutional technical levels
+        sl_tp_meta: Dict[str, Any] = {}
+        if sl_price is None or tp_price is None:
+            calc_async_fn = getattr(self.risk_manager, "calculate_sl_tp_async", None)
+            if calc_async_fn is not None and inspect.iscoroutinefunction(calc_async_fn):
+                calc_sl, calc_tp, sl_tp_meta = await calc_async_fn(
+                    side=side,
+                    entry_price=price,
+                    margin=margin,
+                    leverage=int(leverage),
+                    contract_value=contract_val,
+                    size=int(size) if size >= 1 else 1,
+                    atr=atr if atr is not None else 100.0,
+                    tick_size=tick_size,
+                    technical_levels=technical_levels or kwargs.get("technical_levels"),
+                    setup_type=setup_type,
+                    trap_wick_price=kwargs.get("trap_wick_price", None),
+                    symbol=symbol,
+                )
+            else:
+                raw = self.risk_manager.calculate_sl_tp(
+                    side=side,
+                    entry_price=price,
+                    margin=margin,
+                    leverage=int(leverage),
+                    contract_value=contract_val,
+                    size=int(size) if size >= 1 else 1,
+                    atr=atr if atr is not None else 100.0,
+                    tick_size=tick_size,
+                    structural_target=structural_target_tp,
+                    setup_type=setup_type,
+                    trap_wick_price=kwargs.get("trap_wick_price", None),
+                )
+                if inspect.isawaitable(raw):
+                    raw = await raw
+                calc_sl, calc_tp = raw[0], raw[1]
+                sl_tp_meta = {"source": "FALLBACK", "sl_anchor": "STATIC", "tp_target_type": "STATIC"}
+
+            final_sl = round_to_tick(sl_price if sl_price is not None else calc_sl, tick_size)
+            final_tp = round_to_tick(tp_price if tp_price is not None else calc_tp, tick_size)
+        else:
+            final_sl = round_to_tick(sl_price, tick_size)
+            final_tp = round_to_tick(tp_price, tick_size)
+            risk = abs(price - final_sl)
+            reward = abs(final_tp - price)
+            sl_tp_meta = {
+                "source": "EXPLICIT",
+                "sl_anchor": "PROVIDED",
+                "tp_target_type": "PROVIDED",
+                "target_rr": (reward / risk) if risk > 0 else 2.0,
+                "realized_rr": (reward / risk) if risk > 0 else 2.0,
+            }
 
         # Step 7: Fees + Slippage
         fees = notional * max(float(product.get("taker_commission_rate", 0.0005)), float(product.get("maker_commission_rate", 0.0002)))
@@ -277,6 +333,7 @@ class OrderManager:
             fees=fees,
             slippage=slippage,
             liquidation_distance=liquidation_distance,
+            conviction_multiplier=conviction_mult,
         )
         is_valid = val_res[0] if isinstance(val_res, tuple) else bool(val_res)
         if not is_valid:
@@ -285,7 +342,14 @@ class OrderManager:
             return None
 
         # Smart Execution Routing: LIMIT_PULLBACK (Maker fee efficiency) vs MARKET_MOMENTUM (Breakouts)
-        if setup_type in ("ORDER_BLOCK_PULLBACK", "FVG_RETEST", "TREND_PULLBACK"):
+        routing_rec = kwargs.get("execution_routing") or kwargs.get("routing_order_type")
+        if routing_rec in ("MAKER_POST_ONLY", "LIMIT_MAKER_OPTIMIZED"):
+            execution_routing = "LIMIT_MAKER_OPTIMIZED"
+        elif routing_rec == "CHASE_LIMIT":
+            execution_routing = "LIMIT_CHASE"
+        elif routing_rec == "INSTANT_MARKET_TAKER":
+            execution_routing = "MARKET_MOMENTUM"
+        elif setup_type in ("ORDER_BLOCK_PULLBACK", "FVG_RETEST", "TREND_PULLBACK"):
             execution_routing = "LIMIT_PULLBACK"
         else:
             execution_routing = "MARKET_MOMENTUM"
@@ -341,6 +405,13 @@ class OrderManager:
                     setup_type=setup_type,
                     execution_routing=execution_routing,
                     entry_fingerprint=fingerprint or kwargs.get("fingerprint"),
+                    sl_anchor=sl_tp_meta.get("sl_anchor", "STATIC"),
+                    tp_target_type=sl_tp_meta.get("tp_target_type", "STATIC"),
+                    target_rr=sl_tp_meta.get("target_rr", 2.0),
+                    realized_rr=sl_tp_meta.get("realized_rr", 2.0),
+                    cushion_grade=sl_tp_meta.get("cushion_grade"),
+                    conviction_multiplier=float(kwargs.get("conviction_multiplier", 1.0)),
+                    jev_metadata=sl_tp_meta,
                 )
                 self.active_orders[order_id] = active_order
 
@@ -473,8 +544,8 @@ class OrderManager:
             except Exception as e:
                 logger.error(f"Failed to record trade result in pattern memory: {e}")
 
-            # Jev AI Mistake Forensics (Async background diagnosis for losses)
-            if pnl < 0 and self.jev_client and getattr(self.jev_client, "enabled", False):
+            # Jev AI Post-Trade Forensics (Async background diagnosis and pattern tagging)
+            if self.jev_client and getattr(self.jev_client, "enabled", False):
                 asyncio.create_task(
                     self._run_jev_forensics(
                         symbol=symbol,
@@ -772,29 +843,54 @@ class OrderManager:
         close_reason: str,
         fingerprint: Any,
     ) -> None:
-        """Asynchronously diagnose stopped-out trade with Jev AI and update pattern memory."""
+        """Asynchronously diagnose closed trade with Jev AI and tag pattern memory."""
         try:
-            forensics = await self.jev_client.diagnose_stopped_out_trade(
-                symbol=symbol,
-                side=side,
-                entry_price=entry_p,
-                exit_price=exit_p,
-                pnl=pnl,
-                close_reason=close_reason,
-            )
-            if forensics and self.pattern_memory:
-                classified_reason = f"{forensics.root_cause} (prev={forensics.was_preventable:.2f}, {close_reason})"
-                fingerprint.close_reason = classified_reason
-                # Update in-memory and disk losing patterns with AI classification
-                if hasattr(self.pattern_memory, "losing_patterns"):
-                    for lp in reversed(self.pattern_memory.losing_patterns):
-                        if getattr(lp, "trade_id", None) == getattr(fingerprint, "trade_id", None):
-                            lp.close_reason = classified_reason
+            if hasattr(self.jev_client, "evaluate_post_trade_forensics"):
+                forensics = await self.jev_client.evaluate_post_trade_forensics(
+                    symbol=symbol,
+                    side=side,
+                    entry_price=entry_p,
+                    exit_price=exit_p,
+                    pnl_pct=(pnl / (entry_p * 0.04)) * 100.0 if entry_p > 0 else 0.0,
+                    holding_time_sec=time.time() - getattr(fingerprint, "timestamp", time.time()),
+                    exit_reason=close_reason,
+                )
+                if forensics and self.pattern_memory:
+                    classified_reason = f"{forensics.root_cause} [{forensics.pattern_tag}] ({close_reason})"
+                    fingerprint.close_reason = classified_reason
+                    fingerprint.root_cause = forensics.root_cause
+                    fingerprint.pattern_tag = forensics.pattern_tag
+                    target_list = self.pattern_memory.winning_patterns if pnl > 0 else self.pattern_memory.losing_patterns
+                    target_file = self.pattern_memory.winning_file if pnl > 0 else self.pattern_memory.losing_file
+                    for pat in reversed(target_list):
+                        if getattr(pat, "trade_id", None) == getattr(fingerprint, "trade_id", None):
+                            pat.close_reason = classified_reason
+                            pat.root_cause = forensics.root_cause
+                            pat.pattern_tag = forensics.pattern_tag
                             break
-                    self.pattern_memory._save_patterns(
-                        self.pattern_memory.losing_file, self.pattern_memory.losing_patterns
-                    )
-                logger.info(f"Pattern memory updated with Jev forensics: {classified_reason}")
+                    self.pattern_memory._save_patterns(target_file, target_list)
+                    logger.info(f"Pattern memory updated with Jev forensics: {classified_reason}")
+            elif hasattr(self.jev_client, "diagnose_stopped_out_trade"):
+                forensics = await self.jev_client.diagnose_stopped_out_trade(
+                    symbol=symbol,
+                    side=side,
+                    entry_price=entry_p,
+                    exit_price=exit_p,
+                    pnl=pnl,
+                    close_reason=close_reason,
+                )
+                if forensics and self.pattern_memory:
+                    classified_reason = f"{forensics.root_cause} (prev={forensics.was_preventable:.2f}, {close_reason})"
+                    fingerprint.close_reason = classified_reason
+                    if hasattr(self.pattern_memory, "losing_patterns"):
+                        for lp in reversed(self.pattern_memory.losing_patterns):
+                            if getattr(lp, "trade_id", None) == getattr(fingerprint, "trade_id", None):
+                                lp.close_reason = classified_reason
+                                break
+                        self.pattern_memory._save_patterns(
+                            self.pattern_memory.losing_file, self.pattern_memory.losing_patterns
+                        )
+                    logger.info(f"Pattern memory updated with Jev forensics: {classified_reason}")
         except Exception as e:
             logger.debug(f"Error executing Jev forensics: {e}")
 

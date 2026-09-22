@@ -66,6 +66,8 @@ class MarketPatternFingerprint:
     pnl: float = 0.0
     close_reason: str = "PENDING"
     trade_id: str = ""
+    root_cause: str = ""
+    pattern_tag: str = ""
     timestamp: float = field(default_factory=time.time)
 
     def to_vector(self) -> np.ndarray:
@@ -284,6 +286,8 @@ class PatternMemoryStore:
         pnl: float,
         close_reason: str,
         trade_id: Optional[str] = None,
+        root_cause: Optional[str] = None,
+        pattern_tag: Optional[str] = None,
     ):
         """Record trade result into winning or losing patterns file and update vector index."""
         fingerprint.pnl = float(pnl)
@@ -293,6 +297,10 @@ class PatternMemoryStore:
             fingerprint.trade_id = trade_id
         elif not fingerprint.trade_id:
             fingerprint.trade_id = f"TRD-{int(time.time()*1000)}"
+        if root_cause:
+            fingerprint.root_cause = root_cause
+        if pattern_tag:
+            fingerprint.pattern_tag = pattern_tag
 
         if pnl > 0:
             self.winning_patterns.append(fingerprint)

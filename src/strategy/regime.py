@@ -26,6 +26,17 @@ class RegimeFilter:
             
         return RegimeState.RANGING
 
+    def evaluate_with_jev(self, adx: float, atr: float, avg_atr: float, jev_regime: Any = None) -> RegimeState:
+        """Combine local ADX/ATR with Jev System One Regime Arbiter."""
+        if jev_regime and getattr(jev_regime, "market_regime", None):
+            if jev_regime.market_regime == "DEAD_CHOP" or not getattr(jev_regime, "is_favorable", True):
+                return RegimeState.RANGING
+            if jev_regime.market_regime == "TRENDING_EXPANSION":
+                return RegimeState.TRENDING
+            if jev_regime.market_regime == "MANIPULATION_SWEEP":
+                return RegimeState.VOLATILE
+        return self.evaluate(adx, atr, avg_atr)
+
     def get_position_sizing_advice(self, adx: float, atr: float, avg_atr: float) -> RegimeAdvice:
         state = self.evaluate(adx, atr, avg_atr)
         

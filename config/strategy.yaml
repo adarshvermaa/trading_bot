@@ -73,5 +73,11 @@ jev:
   min_setup_grade: 2.5              # Minimum institutional setup grade (0.0 to 4.0)
   enable_active_monitoring: true    # Enable dynamic trade health & momentum evaluation
   enable_mistake_forensics: true    # Diagnose stopped-out trades and log to patterns.db
+  enable_dynamic_sl_tp: true        # Enable Jev AI dynamic SL and TP resolution
+  enable_dynamic_trailing: true     # Enable Jev AI dynamic trailing stop loss
+  min_risk_reward_ratio: 2.0        # Minimum allowable mathematical Risk:Reward ratio
+  target_risk_reward_ratio: 2.5     # Default institutional target Risk:Reward ratio
+  max_risk_reward_ratio: 5.0        # Maximum expansion ceiling for runners
+  trailing_interval_seconds: 5      # Seconds between dynamic trailing checks
 
 
