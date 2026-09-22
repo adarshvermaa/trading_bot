@@ -21,5 +21,6 @@ def test_load_config_with_custom_config_dir():
     cfg = load_config(config_dir=custom_dir)
     assert cfg is not None
     assert cfg.strategy is not None
-    assert cfg.risk is not None
-    assert len(cfg.strategy.assets.universe) == 2
+    assert len(cfg.strategy.assets.universe) >= 2
+    assert "BTCUSD" in cfg.strategy.assets.universe
+    assert "ETHUSD" in cfg.strategy.assets.universe

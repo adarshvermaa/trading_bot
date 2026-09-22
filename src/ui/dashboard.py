@@ -204,13 +204,25 @@ class Dashboard:
         radar_table.add_column("Status", justify="center", width=12)
 
         assets = self.market_watch_data.get("assets", {})
-        tracked_symbols = ["BTCUSD", "ETHUSD"]
+        tracked_symbols = list(assets.keys()) if assets else ["BTCUSD", "ETHUSD"]
         for sym in tracked_symbols:
             data = assets.get(sym, {})
             price_val = data.get("delta_price") or data.get("price") or (
-                self.signal_data.get("btc_price") if sym == "BTCUSD" else self.signal_data.get("eth_price")
+                self.signal_data.get("btc_price") if sym == "BTCUSD" else (
+                    self.signal_data.get("eth_price") if sym == "ETHUSD" else None
+                )
             )
-            price_str = f"${price_val:,.2f}" if (isinstance(price_val, (int, float)) and price_val > 0) else "--"
+            if isinstance(price_val, (int, float)) and price_val > 0:
+                if price_val < 0.01:
+                    price_str = f"${price_val:,.6f}"
+                elif price_val < 1.0:
+                    price_str = f"${price_val:,.4f}"
+                elif price_val < 10.0:
+                    price_str = f"${price_val:,.3f}"
+                else:
+                    price_str = f"${price_val:,.2f}"
+            else:
+                price_str = "--"
             
             # 15M Bias badge
             bias = str(data.get("bias_15m") or "--").upper()
@@ -237,7 +249,9 @@ class Dashboard:
                 ob_col = "green" if ob_d == "BULL" else "red"
                 ob_b = data.get("ob_bottom", 0.0)
                 ob_t = data.get("ob_top", 0.0)
-                ob_text = Text(f"{ob_d} {ob_b:.0f}-{ob_t:.0f}", style=ob_col)
+                b_str = f"{ob_b:.4f}" if ob_t < 1.0 else (f"{ob_b:.2f}" if ob_t < 10.0 else f"{ob_b:.0f}")
+                t_str = f"{ob_t:.4f}" if ob_t < 1.0 else (f"{ob_t:.2f}" if ob_t < 10.0 else f"{ob_t:.0f}")
+                ob_text = Text(f"{ob_d} {b_str}-{t_str}", style=ob_col)
             else:
                 ob_text = Text("--", style="grey50")
 
@@ -245,7 +259,9 @@ class Dashboard:
             vah = data.get("vah", 0.0)
             val = data.get("val", 0.0)
             if vah and val:
-                va_text = Text(f"{val:.0f}-{vah:.0f}", style="cyan")
+                val_str = f"{val:.4f}" if vah < 1.0 else (f"{val:.2f}" if vah < 10.0 else f"{val:.0f}")
+                vah_str = f"{vah:.4f}" if vah < 1.0 else (f"{vah:.2f}" if vah < 10.0 else f"{vah:.0f}")
+                va_text = Text(f"{val_str}-{vah_str}", style="cyan")
             else:
                 va_text = Text("--", style="grey50")
 

@@ -20,7 +20,7 @@ from typing import Any
 from src.cli import parse_args
 from src.config import load_config, AppConfig
 from src.data.delta_ws import DeltaWSClient, CandleStore, Candle
-from src.execution.delta import DeltaExchangeClient
+from src.execution.delta import DeltaExchangeClient, normalize_delta_symbol
 from src.execution.order_manager import OrderManager, OrderState
 from src.strategy.structure import MarketStructure
 from src.strategy.signals import SignalGenerator
@@ -48,7 +48,11 @@ class ScalpingBot:
         self._shutdown = asyncio.Event()
 
         # ---- Data layer (Delta Exchange WebSocket & CandleStore) ----
-        target_symbols = ["BTCUSD", "ETHUSD"]
+        target_symbols = (
+            list(config.strategy.assets.universe)
+            if (config.strategy and getattr(config.strategy, "assets", None) and config.strategy.assets.universe)
+            else ["BTCUSD", "ETHUSD"]
+        )
         self.delta_ws = DeltaWSClient(
             symbols=target_symbols,
             ws_url=config.env.delta_ws_url,
@@ -1319,21 +1323,29 @@ class ScalpingBot:
                     # Signal data: use monitored_market (updated by strategy loop during position)
                     signal_data = dict(self._monitored_market) if self._monitored_market else {}
 
-                    # Continuously refresh real-time prices on every tick
+                    # Continuously refresh real-time prices on every tick for all universe assets
                     btc_p = self._get_live_price("BTCUSD")
                     eth_p = self._get_live_price("ETHUSD")
-                    btc_delta = self.delta_client.get_latest_price("BTCUSD") or btc_p
-                    eth_delta = self.delta_client.get_latest_price("ETHUSD") or eth_p
                     if btc_p > 0:
                         signal_data["btc_price"] = btc_p
-                        if "BTCUSD" in self._market_watch.get("assets", {}):
-                            self._market_watch["assets"]["BTCUSD"]["price"] = btc_p
-                            self._market_watch["assets"]["BTCUSD"]["delta_price"] = btc_delta
                     if eth_p > 0:
                         signal_data["eth_price"] = eth_p
-                        if "ETHUSD" in self._market_watch.get("assets", {}):
-                            self._market_watch["assets"]["ETHUSD"]["price"] = eth_p
-                            self._market_watch["assets"]["ETHUSD"]["delta_price"] = eth_delta
+
+                    # Update all assets in market watch
+                    assets_dict = self._market_watch.setdefault("assets", {})
+                    for sym in self.config.strategy.assets.universe:
+                        sym_p = self._get_live_price(sym)
+                        sym_dp = self.delta_client.get_latest_price(sym) or sym_p
+                        if sym in assets_dict:
+                            if sym_p > 0:
+                                assets_dict[sym]["price"] = sym_p
+                                assets_dict[sym]["delta_price"] = sym_dp
+                        elif sym_p > 0:
+                            assets_dict[sym] = {
+                                "symbol": sym,
+                                "price": sym_p,
+                                "delta_price": sym_dp,
+                            }
 
 
                     if self._best_signal and not self.order_manager.active_order:
@@ -1456,7 +1468,7 @@ class ScalpingBot:
         tasks = []
 
         if self.mode in ("paper", "live"):
-            tasks.append(asyncio.create_task(self.delta_client.run_public_ticker(["BTCUSD", "ETHUSD"])))
+            tasks.append(asyncio.create_task(self.delta_client.run_public_ticker(list(self.config.strategy.assets.universe))))
             tasks.append(asyncio.create_task(self._run_delta_ws()))
             tasks.append(asyncio.create_task(self._strategy_loop()))
             tasks.append(asyncio.create_task(self._position_monitor_loop()))
@@ -1549,6 +1561,23 @@ def main() -> None:
     )
 
     logger.info(f"Config loaded: {config.env}")
+
+    # CLI overrides for target trading universe
+    if getattr(args, "symbols", None):
+        from src.execution.delta import normalize_delta_symbol
+        raw_syms = [s.strip() for s in args.symbols.split(",") if s.strip()]
+        normalized_syms = [normalize_delta_symbol(s) for s in raw_syms]
+        if normalized_syms:
+            config.strategy.assets.universe = normalized_syms
+            logger.info(f"Target universe overridden via --symbols: {normalized_syms}")
+    elif getattr(args, "universe", None):
+        preset_name = args.universe.strip().lower()
+        presets = getattr(config.strategy.assets, "presets", {})
+        if presets and preset_name in presets:
+            config.strategy.assets.universe = list(presets[preset_name])
+            logger.info(f"Target universe preset '{preset_name}' applied: {config.strategy.assets.universe}")
+        else:
+            logger.warning(f"Universe preset '{preset_name}' not found. Available: {list(presets.keys()) if presets else 'None'}")
 
     if args.kill_switch:
         logger.warning("Kill switch activated via CLI")

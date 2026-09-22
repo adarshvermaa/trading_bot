@@ -47,6 +47,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Starting balance for paper trading (default: 10000)",
     )
     parser.add_argument(
+        "--universe",
+        type=str,
+        default=None,
+        help="Universe preset to scan/trade (e.g. 'majors', 'top10', 'gold')",
+    )
+    parser.add_argument(
+        "--symbols",
+        type=str,
+        default=None,
+        help="Comma-separated custom symbols to scan/trade (e.g. 'BTCUSD,SOLUSD,XAUTUSD')",
+    )
+    parser.add_argument(
         "-y",
         "--yes",
         action="store_true",

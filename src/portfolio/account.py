@@ -28,7 +28,36 @@ class Position:
 CONTRACT_VALUES: Dict[str, float] = {
     "BTCUSD": 0.001,
     "ETHUSD": 0.01,
+    "SOLUSD": 1.0,
+    "XAUTUSD": 0.001,
+    "PAXGUSD": 0.001,
+    "DOGEUSD": 100.0,
+    "ZECUSD": 0.1,
+    "XRPUSD": 1.0,
+    "BNBUSD": 0.1,
+    "AVAXUSD": 1.0,
 }
+
+
+def get_contract_value(symbol: str) -> float:
+    """Return contract value in underlying units for a given symbol."""
+    s = str(symbol or "").upper().strip()
+    if s in CONTRACT_VALUES:
+        return CONTRACT_VALUES[s]
+    if "BTC" in s:
+        return 0.001
+    if "ETH" in s:
+        return 0.01
+    if "SOL" in s or "XRP" in s or "AVAX" in s:
+        return 1.0
+    if "DOGE" in s:
+        return 100.0
+    if "XAU" in s or "PAX" in s or "GOLD" in s:
+        return 0.001
+    if "ZEC" in s or "BNB" in s:
+        return 0.1
+    return 1.0
+
 
 class AccountManager:
     def __init__(self, is_paper: bool = False, initial_paper_balance: float = 10000.0, paper_balance: Optional[float] = None):
@@ -49,12 +78,23 @@ class AccountManager:
         self.positions: Dict[str, Position] = {}
 
     def get_contract_value(self, symbol: str) -> float:
+        s = str(symbol or "").upper().strip()
+        if s in self.contract_values:
+            return self.contract_values[s]
         if symbol in self.contract_values:
             return self.contract_values[symbol]
-        if "BTC" in symbol:
+        if "BTC" in s:
             return 0.001
-        if "ETH" in symbol:
+        if "ETH" in s:
             return 0.01
+        if "SOL" in s or "XRP" in s or "AVAX" in s:
+            return 1.0
+        if "DOGE" in s:
+            return 100.0
+        if "XAU" in s or "PAX" in s or "GOLD" in s:
+            return 0.001
+        if "ZEC" in s or "BNB" in s:
+            return 0.1
         return 1.0
         
     def update_from_exchange(self, balances: Dict[str, Any], exchange_positions: List[Dict[str, Any]]):

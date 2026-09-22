@@ -98,6 +98,11 @@ class SessionConfig(BaseModel):
 
 class AssetConfig(BaseModel):
     universe: list[str] = Field(default_factory=lambda: ["BTCUSD", "ETHUSD"])
+    presets: dict[str, list[str]] = Field(default_factory=lambda: {
+        "majors": ["BTCUSD", "ETHUSD"],
+        "top10": ["BTCUSD", "ETHUSD", "SOLUSD", "XAUTUSD", "PAXGUSD", "DOGEUSD", "ZECUSD", "XRPUSD", "BNBUSD", "AVAXUSD"],
+        "gold": ["XAUTUSD", "PAXGUSD"],
+    })
 
 
 class BreakoutConfig(BaseModel):

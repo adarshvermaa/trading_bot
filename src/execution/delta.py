@@ -88,15 +88,143 @@ DELTA_DEFAULT_PRODUCTS: Dict[str, Dict[str, Any]] = {
         "state": "live",
         "trading_status": "operational",
     },
+    "SOLUSD": {
+        "id": 14823,
+        "symbol": "SOLUSD",
+        "contract_type": "perpetual_futures",
+        "contract_value": 1.0,
+        "tick_size": 0.0001,
+        "initial_margin": 1.0,
+        "default_leverage": 100.0,
+        "max_leverage": 100.0,
+        "taker_commission_rate": 0.0005,
+        "maker_commission_rate": 0.0002,
+        "state": "live",
+        "trading_status": "operational",
+    },
+    "XAUTUSD": {
+        "id": 131253,
+        "symbol": "XAUTUSD",
+        "contract_type": "perpetual_futures",
+        "contract_value": 0.001,
+        "tick_size": 0.01,
+        "initial_margin": 1.0,
+        "default_leverage": 100.0,
+        "max_leverage": 100.0,
+        "taker_commission_rate": 0.0005,
+        "maker_commission_rate": 0.0002,
+        "state": "live",
+        "trading_status": "operational",
+    },
+    "PAXGUSD": {
+        "id": 123006,
+        "symbol": "PAXGUSD",
+        "contract_type": "perpetual_futures",
+        "contract_value": 0.001,
+        "tick_size": 0.01,
+        "initial_margin": 1.0,
+        "default_leverage": 100.0,
+        "max_leverage": 100.0,
+        "taker_commission_rate": 0.0005,
+        "maker_commission_rate": 0.0002,
+        "state": "live",
+        "trading_status": "operational",
+    },
+    "DOGEUSD": {
+        "id": 14745,
+        "symbol": "DOGEUSD",
+        "contract_type": "perpetual_futures",
+        "contract_value": 100.0,
+        "tick_size": 0.000001,
+        "initial_margin": 1.0,
+        "default_leverage": 100.0,
+        "max_leverage": 100.0,
+        "taker_commission_rate": 0.0005,
+        "maker_commission_rate": 0.0002,
+        "state": "live",
+        "trading_status": "operational",
+    },
+    "ZECUSD": {
+        "id": 98573,
+        "symbol": "ZECUSD",
+        "contract_type": "perpetual_futures",
+        "contract_value": 0.1,
+        "tick_size": 0.01,
+        "initial_margin": 5.0,
+        "default_leverage": 20.0,
+        "max_leverage": 20.0,
+        "taker_commission_rate": 0.0005,
+        "maker_commission_rate": 0.0002,
+        "state": "live",
+        "trading_status": "operational",
+    },
+    "XRPUSD": {
+        "id": 14969,
+        "symbol": "XRPUSD",
+        "contract_type": "perpetual_futures",
+        "contract_value": 1.0,
+        "tick_size": 0.0001,
+        "initial_margin": 1.0,
+        "default_leverage": 100.0,
+        "max_leverage": 100.0,
+        "taker_commission_rate": 0.0005,
+        "maker_commission_rate": 0.0002,
+        "state": "live",
+        "trading_status": "operational",
+    },
+    "BNBUSD": {
+        "id": 15042,
+        "symbol": "BNBUSD",
+        "contract_type": "perpetual_futures",
+        "contract_value": 0.1,
+        "tick_size": 0.001,
+        "initial_margin": 1.0,
+        "default_leverage": 100.0,
+        "max_leverage": 100.0,
+        "taker_commission_rate": 0.0005,
+        "maker_commission_rate": 0.0002,
+        "state": "live",
+        "trading_status": "operational",
+    },
+    "AVAXUSD": {
+        "id": 14830,
+        "symbol": "AVAXUSD",
+        "contract_type": "perpetual_futures",
+        "contract_value": 1.0,
+        "tick_size": 0.0001,
+        "initial_margin": 1.0,
+        "default_leverage": 100.0,
+        "max_leverage": 100.0,
+        "taker_commission_rate": 0.0005,
+        "maker_commission_rate": 0.0002,
+        "state": "live",
+        "trading_status": "operational",
+    },
 }
 
 def normalize_delta_symbol(symbol: str) -> str:
-    """Normalize asset or symbol string into Delta's official perpetual symbol (BTCUSD or ETHUSD)."""
+    """Normalize asset or symbol string into Delta's official perpetual symbol."""
     s = (symbol or "").upper().strip()
     if s in ("BTC", "BTCUSD", "BTCUSDT"):
         return "BTCUSD"
     if s in ("ETH", "ETHUSD", "ETHUSDT"):
         return "ETHUSD"
+    if s in ("SOL", "SOLUSD", "SOLUSDT"):
+        return "SOLUSD"
+    if s in ("XAU", "XAUT", "XAUUSD", "XAUTUSD", "GOLD"):
+        return "XAUTUSD"
+    if s in ("PAX", "PAXG", "PAXUSD", "PAXGUSD"):
+        return "PAXGUSD"
+    if s in ("DOGE", "DOGEUSD", "DOGEUSDT"):
+        return "DOGEUSD"
+    if s in ("ZEC", "ZECUSD", "ZECUSDT"):
+        return "ZECUSD"
+    if s in ("XRP", "XRPUSD", "XRPUSDT"):
+        return "XRPUSD"
+    if s in ("BNB", "BNBUSD", "BNBUSDT"):
+        return "BNBUSD"
+    if s in ("AVAX", "AVAXUSD", "AVAXUSDT"):
+        return "AVAXUSD"
     return s
 
 class DeltaExchangeClient:
@@ -188,8 +316,8 @@ class DeltaExchangeClient:
         return await make_request()
 
     async def fetch_target_products(self, symbols: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
-        """Fetch and cache official Delta product specifications for BTC and ETH only."""
-        target_symbols = symbols if symbols is not None else ["BTCUSD", "ETHUSD"]
+        """Fetch and cache official Delta product specifications for target universe assets."""
+        target_symbols = symbols if symbols is not None else list(DELTA_DEFAULT_PRODUCTS.keys())
         fetched = {}
         for sym in target_symbols:
             norm_sym = normalize_delta_symbol(sym)

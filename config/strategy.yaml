@@ -2,6 +2,32 @@ assets:
   universe:
     - BTCUSD
     - ETHUSD
+    - SOLUSD
+    - XAUTUSD
+    - PAXGUSD
+    - DOGEUSD
+    - ZECUSD
+    - XRPUSD
+    - BNBUSD
+    - AVAXUSD
+  presets:
+    majors:
+      - BTCUSD
+      - ETHUSD
+    top10:
+      - BTCUSD
+      - ETHUSD
+      - SOLUSD
+      - XAUTUSD
+      - PAXGUSD
+      - DOGEUSD
+      - ZECUSD
+      - XRPUSD
+      - BNBUSD
+      - AVAXUSD
+    gold:
+      - XAUTUSD
+      - PAXGUSD
 
 
 timeframes:
