@@ -77,12 +77,20 @@ class Dashboard:
         )
 
         # Center: Leverage & Strategic Rules
+        dyn_lev = self.signal_data.get("dynamic_leverage")
+        if dyn_lev and dyn_lev != "--":
+            lev_str = f"DynLev {dyn_lev}"
+            lev_col = "bold bright_green" if "WIN_WIN" in str(dyn_lev) else ("bold cyan" if "HIGH" in str(dyn_lev) else "bold yellow")
+        else:
+            lev_str = f"{self.target_leverage}x Isolated"
+            lev_col = "bold white"
+
         center_text = Text.assemble(
-            (f"{self.target_leverage}x Isolated", "bold white"),
+            (lev_str, lev_col),
             (" | ", "grey50"),
             ("Jev Sys1 Active", "bold magenta"),
             (" | ", "grey50"),
-            ("R:R ≥ 1:1.5R", "bold green"),
+            ("R:R ≥ 2.5R", "bold green"),
         )
 
         # Right: UTC Clock & Status
@@ -315,7 +323,9 @@ class Dashboard:
         if hl_parts:
             footer_grid.add_row("Key Levels", Text(": " + " | ".join(hl_parts), style="magenta"))
 
-        footer_grid.add_row("Execution", f": {self.target_leverage}x Isolated | Maker 0.02% Fee | 29m Delta Limit Offer")
+        dyn_lev = self.signal_data.get("dynamic_leverage")
+        lev_label = f"DynLev {dyn_lev}" if (dyn_lev and dyn_lev != "--") else f"{self.target_leverage}x Isolated"
+        footer_grid.add_row("Execution", f": {lev_label} | Maker 0.02% Fee | 29m Delta Limit Offer")
         
         trigger = self.market_watch_data.get("next_trigger") or self.signal_data.get("next_trigger", "Awaiting 5M BOS/CHoCH + ML >= 65%")
         trigger_col = "bold green" if "READY" in trigger.upper() or "CONFLUENCE" in trigger.upper() else "yellow"
@@ -490,6 +500,10 @@ class Dashboard:
         table.add_row("Cross SMT", Text(f": {smt}", style=smt_col))
         
         table.add_row("Score", f": {self.signal_data.get('signal_score', '--')}")
+        dyn_lev = self.signal_data.get('dynamic_leverage')
+        if dyn_lev and dyn_lev != '--':
+            lev_c = "bold bright_green" if "WIN_WIN" in str(dyn_lev) else ("bold cyan" if "HIGH" in str(dyn_lev) else "bold yellow")
+            table.add_row("Dynamic Lev", Text(f": {dyn_lev}", style=lev_c))
 
         setup_t = self.signal_data.get('setup_type', 'NONE')
         if setup_t and setup_t != "NONE":

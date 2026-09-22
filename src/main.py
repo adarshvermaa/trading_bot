@@ -20,7 +20,7 @@ from typing import Any
 from src.cli import parse_args
 from src.config import load_config, AppConfig
 from src.data.delta_ws import DeltaWSClient, CandleStore, Candle
-from src.execution.delta import DeltaExchangeClient, normalize_delta_symbol
+from src.execution.delta import DeltaExchangeClient, normalize_delta_symbol, DELTA_DEFAULT_PRODUCTS
 from src.execution.order_manager import OrderManager, OrderState
 from src.strategy.structure import MarketStructure
 from src.strategy.signals import SignalGenerator
@@ -136,6 +136,7 @@ class ScalpingBot:
         self._last_smt_result: Optional[Any] = None
         self._last_conviction_mult: float = 1.0
         self._last_routing_choice: str = "MAKER_POST_ONLY"
+        self._last_dynamic_leverage: Optional[Any] = None
         self._re_entry_cooldown_until: float = 0.0
         self._asset_rankings: list[dict[str, Any]] = []
         self._market_watch: dict[str, Any] = {"assets": {}}
@@ -918,6 +919,54 @@ class ScalpingBot:
         top["conviction_multiplier"] = conviction_mult
         top["execution_routing"] = routing_choice
 
+        # Dynamic Leverage calculation for top candidate
+        dynamic_lev_result = None
+        target_leverage = None
+
+        if top["is_actionable"]:
+            try:
+                prod_info = DELTA_DEFAULT_PRODUCTS.get(top["symbol"], {})
+                exch_max_lev = float(prod_info.get("max_leverage", 100.0))
+
+                jev_conf = top.get("ml_confidence", 0.70)
+                if self.jev_client and getattr(self.jev_client, "enabled", False):
+                    try:
+                        grade_val = 3.0 if top.get("ml_confirmed") else 2.5
+                        jev_lev = await self.jev_client.evaluate_dynamic_leverage(
+                            symbol=top["symbol"],
+                            setup_grade=grade_val,
+                            dir_conf=top.get("score", 0.8),
+                            onnx_conf=top.get("ml_confidence", 0.7),
+                        )
+                        if jev_lev:
+                            jev_conf = jev_lev.ai_confidence
+                    except Exception as ex:
+                        logger.debug(f"Jev dynamic leverage error: {ex}")
+
+                # Calculate dynamic leverage using RiskManager
+                dynamic_lev_result = self.risk_manager.calculate_dynamic_leverage(
+                    symbol=top["symbol"],
+                    direction=top["signal"].direction,
+                    entry_price=top["signal"].entry_price,
+                    sl_price=top["signal"].sl_price,
+                    structure=top.get("structure"),
+                    signal=top.get("signal"),
+                    jev_confidence=jev_conf,
+                    atr=top.get("atr", 0.0),
+                    avg_atr=top.get("atr", 0.0),
+                    exchange_max_leverage=exch_max_lev,
+                    playbook=getattr(top.get("structure"), "playbook", None),
+                    pricing_zone=getattr(top.get("structure"), "pricing_zone", None),
+                    equity=self.account_manager.equity,
+                )
+                target_leverage = dynamic_lev_result.leverage
+                self._last_dynamic_leverage = dynamic_lev_result
+            except Exception as ex:
+                logger.debug(f"Dynamic leverage calculation error: {ex}")
+
+        top["dynamic_leverage"] = target_leverage
+        top["dynamic_leverage_result"] = dynamic_lev_result
+
         # Formatted ranking summary string for dashboard: e.g. "#1 BTCUSD: 0.78 (LONG) | #2 ETHUSD: 0.62 (NONE)"
         rankings_str = " | ".join(
             [f"#{i+1} {e['symbol']} ({e['score']:.2f}, {e['signal'].direction})" for i, e in enumerate(evaluations)]
@@ -1009,6 +1058,7 @@ class ScalpingBot:
             "smt_status": "SMT TRAP ALERT" if (self._last_smt_result and self._last_smt_result.is_trap_warning) else "SYNC",
             "conviction_mult": f"{self._last_conviction_mult:.2f}x",
             "routing_mode": self._last_routing_choice,
+            "dynamic_leverage": f"{dynamic_lev_result.leverage}x [{dynamic_lev_result.tier}]" if dynamic_lev_result else "--",
         }
 
         # Return best setup if actionable
@@ -1218,6 +1268,7 @@ class ScalpingBot:
                                 technical_levels=setup.get("technical_levels"),
                                 conviction_multiplier=setup.get("conviction_multiplier", 1.0),
                                 execution_routing=setup.get("execution_routing", "MAKER_POST_ONLY"),
+                                leverage=setup.get("dynamic_leverage"),
                             )
 
                             if placed_order is not None:

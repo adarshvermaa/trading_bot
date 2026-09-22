@@ -163,6 +163,24 @@ class LeverageConfig(BaseModel):
     reject_on_leverage_fail: bool = False
 
 
+class DynamicLeverageTiersConfig(BaseModel):
+    win_win_apex: int = 50
+    high_conviction: int = 30
+    standard_scalp: int = 20
+    defensive_probe: int = 10
+
+
+class DynamicLeverageConfig(BaseModel):
+    enabled: bool = True
+    min_leverage: int = 5
+    max_leverage: int = 50
+    tiers: DynamicLeverageTiersConfig = Field(default_factory=DynamicLeverageTiersConfig)
+    liquidation_buffer_ratio: float = 1.5
+    volatility_throttle_threshold: float = 1.5
+    drawdown_throttle_enabled: bool = True
+
+
+
 class StopLossConfig(BaseModel):
     max_loss_pct_of_margin: float = 0.03
     min_stop_distance_atr: float = 0.05
@@ -205,6 +223,7 @@ class FailsafeConfig(BaseModel):
 class RiskConfig(BaseModel):
     capital: CapitalConfig = Field(default_factory=CapitalConfig)
     leverage: LeverageConfig = Field(default_factory=LeverageConfig)
+    dynamic_leverage: DynamicLeverageConfig = Field(default_factory=DynamicLeverageConfig)
     stop_loss: StopLossConfig = Field(default_factory=StopLossConfig)
     take_profit: TakeProfitConfig = Field(default_factory=TakeProfitConfig)
     trailing_stop: TrailingStopConfig = Field(default_factory=TrailingStopConfig)

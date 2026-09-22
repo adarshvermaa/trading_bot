@@ -209,6 +209,7 @@ class OrderManager:
             lev_res = self.risk_manager.validate_leverage(leverage, max_leverage)
             if isinstance(lev_res, tuple):
                 lev_ok = lev_res[0]
+                leverage = lev_res[1]
             else:
                 lev_ok = bool(lev_res)
             if not lev_ok:

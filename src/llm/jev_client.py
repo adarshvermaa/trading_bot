@@ -136,6 +136,16 @@ class JevSizingResult:
 
 
 @dataclass
+class JevLeverageResult:
+    recommended_tier: str
+    ai_confidence: float
+    leverage_multiplier: float
+    reason: str
+    latency_ms: float
+    raw_answers: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class JevScratchExitResult:
     thesis_integrity: str
     scratch_action: str
@@ -1422,6 +1432,107 @@ class JevClient:
             conviction_multiplier=mult,
             risk_tier=tier,
             confidence=conf,
+            reason=reason,
+            latency_ms=self.last_latency_ms,
+            raw_answers=answers,
+        )
+
+    async def evaluate_dynamic_leverage(
+        self,
+        symbol: str,
+        setup_grade: float,
+        dir_conf: float = 0.80,
+        onnx_conf: float = 0.70,
+        pattern_win_rate: float = 0.60,
+        drawdown_pct: float = 0.0,
+    ) -> JevLeverageResult:
+        """
+        Dynamically determine optimal leverage tier from Jev System One based on
+        trade conviction, win-win probability, and safety constraints.
+        """
+        if not self.enabled:
+            if setup_grade >= 3.5:
+                tier = "WIN_WIN_APEX"
+                conf = 0.90
+                mult = 1.0
+            elif setup_grade >= 2.8:
+                tier = "HIGH_CONVICTION"
+                conf = 0.78
+                mult = 0.75
+            elif setup_grade >= 2.0:
+                tier = "STANDARD_SCALP"
+                conf = 0.68
+                mult = 0.50
+            else:
+                tier = "DEFENSIVE_PROBE"
+                conf = 0.55
+                mult = 0.25
+            return JevLeverageResult(
+                recommended_tier=tier,
+                ai_confidence=conf,
+                leverage_multiplier=mult,
+                reason="Local dynamic leverage evaluation",
+                latency_ms=0.0,
+            )
+
+        state = (
+            f"Symbol: {symbol}, Setup Grade: {setup_grade:.2f}/4.0, Direction Confidence: {dir_conf*100:.0f}%. "
+            f"ONNX ML Confidence: {onnx_conf*100:.1f}%. Historical Pattern Win Rate: {pattern_win_rate*100:.1f}%. "
+            f"Daily Drawdown: {drawdown_pct:.1f}%."
+        )
+
+        questions = {
+            "leverage_tier": {
+                "type": "choice",
+                "instructions": "Determine optimal dynamic leverage tier based on win-win setup quality and edge:",
+                "criteria": {
+                    "WIN_WIN_APEX": "A+ institutional confluence, pristine structure, maximum leverage edge (Tier 1)",
+                    "HIGH_CONVICTION": "Strong trend and volume confirmation, high leverage (Tier 2)",
+                    "STANDARD_SCALP": "Normal baseline scalp, moderate leverage (Tier 3)",
+                    "DEFENSIVE_PROBE": "Borderline edge or wider chop, cautious low leverage (Tier 4)",
+                },
+            },
+            "win_confidence": {
+                "type": "score",
+                "instructions": "Rate setup win-win confidence from 0.0 to 1.0",
+                "criteria": [
+                    "0.0: High trap risk or uncertain chop",
+                    "0.5: Moderate standard scalp probability",
+                    "1.0: Premium A+ win-win institutional setup",
+                ],
+            },
+        }
+
+        answers = await self._query_system_one(state, questions)
+        if not answers:
+            mult = 1.0 if setup_grade >= 3.5 else (0.75 if setup_grade >= 2.8 else (0.50 if setup_grade >= 2.0 else 0.25))
+            tier = "WIN_WIN_APEX" if mult == 1.0 else ("HIGH_CONVICTION" if mult == 0.75 else ("STANDARD_SCALP" if mult == 0.50 else "DEFENSIVE_PROBE"))
+            return JevLeverageResult(
+                recommended_tier=tier,
+                ai_confidence=0.70,
+                leverage_multiplier=mult,
+                reason="Fallback dynamic leverage evaluation",
+                latency_ms=self.last_latency_ms,
+            )
+
+        tier = str(answers.get("leverage_tier", {}).get("choice", "STANDARD_SCALP")).upper()
+        conf_score = float(answers.get("win_confidence", {}).get("score", 0.70))
+        conf = max(0.0, min(1.0, conf_score))
+        
+        tier_mults = {
+            "WIN_WIN_APEX": 1.0,
+            "HIGH_CONVICTION": 0.75,
+            "STANDARD_SCALP": 0.50,
+            "DEFENSIVE_PROBE": 0.25,
+        }
+        mult = tier_mults.get(tier, 0.50)
+        reason = f"Dynamic Leverage: {tier} (AI Conf: {conf:.1%})"
+        logger.info(f"[JEV DYNAMIC LEVERAGE] {symbol}: {reason} ({self.last_latency_ms:.0f}ms)")
+
+        return JevLeverageResult(
+            recommended_tier=tier,
+            ai_confidence=conf,
+            leverage_multiplier=mult,
             reason=reason,
             latency_ms=self.last_latency_ms,
             raw_answers=answers,

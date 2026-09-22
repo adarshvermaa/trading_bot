@@ -4,6 +4,7 @@ from typing import Tuple, List, Dict, Any, Optional
 from datetime import datetime, timezone
 
 from src.config import RiskConfig
+from src.risk.dynamic_leverage import DynamicLeverageEngine, DynamicLeverageResult
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -48,6 +49,7 @@ class RiskManager:
     def __init__(self, config: RiskConfig, jev_client: Optional[Any] = None):
         self.config = config
         self.jev_client = jev_client
+        self.dynamic_leverage_engine = DynamicLeverageEngine(getattr(config, "dynamic_leverage", None))
         
         # State tracking
         self.daily_pnl: float = 0.0
@@ -66,11 +68,57 @@ class RiskManager:
         # Keep track of last daily reset
         self.last_reset_date = datetime.now(timezone.utc).date()
 
+    def calculate_dynamic_leverage(
+        self,
+        symbol: str,
+        direction: str,
+        entry_price: float,
+        sl_price: Optional[float] = None,
+        structure: Optional[Any] = None,
+        signal: Optional[Any] = None,
+        jev_confidence: Optional[float] = None,
+        atr: float = 0.0,
+        avg_atr: float = 0.0,
+        exchange_max_leverage: float = 100.0,
+        obi: float = 0.0,
+        playbook: Optional[str] = None,
+        pricing_zone: Optional[str] = None,
+        equity: float = 10000.0,
+    ) -> DynamicLeverageResult:
+        """Calculate dynamic leverage based on market confluence and AI confidence."""
+        max_daily_loss = equity * getattr(self.config.daily_limits, "max_daily_loss_pct", 0.03)
+        return self.dynamic_leverage_engine.evaluate_leverage(
+            symbol=symbol,
+            direction=direction,
+            entry_price=entry_price,
+            sl_price=sl_price,
+            structure=structure,
+            signal=signal,
+            jev_confidence=jev_confidence,
+            atr=atr,
+            avg_atr=avg_atr,
+            daily_pnl=self.daily_pnl,
+            max_daily_loss=max_daily_loss,
+            exchange_max_leverage=exchange_max_leverage,
+            obi=obi,
+            playbook=playbook,
+            pricing_zone=pricing_zone,
+        )
+
     def validate_leverage(self, symbol_or_leverage: Any, exchange_max_leverage: float) -> Tuple[bool, int, str]:
+        if isinstance(symbol_or_leverage, DynamicLeverageResult):
+            desired_leverage = symbol_or_leverage.leverage
+            actual_leverage = int(min(desired_leverage, exchange_max_leverage))
+            if actual_leverage < desired_leverage and self.config.leverage.reject_on_leverage_fail:
+                return False, int(exchange_max_leverage), f"Dynamic leverage {desired_leverage} exceeds exchange max {exchange_max_leverage}"
+            return True, actual_leverage, "VALID"
+
         if isinstance(symbol_or_leverage, (int, float)):
             desired_leverage = int(symbol_or_leverage)
             if desired_leverage > exchange_max_leverage:
-                return False, int(exchange_max_leverage), f"Leverage {desired_leverage} exceeds max {exchange_max_leverage}"
+                if self.config.leverage.reject_on_leverage_fail:
+                    return False, int(exchange_max_leverage), f"Leverage {desired_leverage} exceeds max {exchange_max_leverage}"
+                return True, int(exchange_max_leverage), "VALID"
             return True, desired_leverage, "VALID"
 
         symbol = str(symbol_or_leverage)
