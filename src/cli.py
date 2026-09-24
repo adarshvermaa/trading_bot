@@ -22,6 +22,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Operating mode (default: paper)",
     )
     parser.add_argument(
+        "--profile",
+        type=str,
+        choices=("scalp", "intraday_swing"),
+        default=None,
+        help="Strategy profile to execute (choices: scalp, intraday_swing)",
+    )
+    parser.add_argument(
         "--config-dir",
         type=str,
         default="config",

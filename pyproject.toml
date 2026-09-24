@@ -28,6 +28,9 @@ dependencies = [
     "rich>=13.7",
 ]
 
+[project.scripts]
+crypto-scalper = "src.main:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.4",
@@ -38,3 +41,8 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
