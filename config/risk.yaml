@@ -14,6 +14,7 @@ leverage:
     - XRPUSD
     - BNBUSD
     - AVAXUSD
+  fixed_leverage: 25
   high_leverage_value: 25
   default_leverage_value: 20
   safe_fallback_leverage: 10
@@ -21,6 +22,7 @@ leverage:
 
 dynamic_leverage:
   enabled: true
+  fixed_leverage: 25
   min_leverage: 5
   max_leverage: 50
   tiers:
@@ -35,10 +37,14 @@ dynamic_leverage:
 stop_loss:
   max_loss_pct_of_margin: 0.03
   min_stop_distance_atr: 0.05
+  liquidation_buffer_ratio: 1.5
 
 take_profit:
   target_pct_of_margin: 2.00
   target_pct_of_margin_max: 2.00
+  min_risk_reward_ratio: 1.8
+  target_risk_reward_ratio: 2.5
+  max_risk_reward_ratio: 3.5
 
 trailing_stop:
   enabled: true
@@ -47,7 +53,6 @@ trailing_stop:
   max_profit_cap_pct_of_margin: 2.00
   scalper_offer_max_seconds_major: 1740  # 29 min (BTCUSD, ETHUSD) for Delta zero closing fee offer
   scalper_offer_max_seconds_other: 840   # 14 min for other futures
-
 
 fees:
   taker_fee_pct: 0.0005

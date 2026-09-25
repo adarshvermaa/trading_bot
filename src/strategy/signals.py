@@ -1,6 +1,6 @@
 import numpy as np
 from dataclasses import dataclass
-from typing import List, Tuple, Any
+from typing import List, Tuple, Any, Dict, Optional
 from src.strategy.structure import StructureAnalysis, calculate_volatility_squeeze, compute_volume_poc
 
 @dataclass
@@ -21,6 +21,15 @@ class Signal:
     pattern: str = "NONE"
     structural_target_tp: float = 0.0
     trap_wick_price: float = 0.0
+    cvd_divergence: str = "NEUTRAL"
+    vwap_band_level: str = "INSIDE"
+    squeeze_state: str = "NONE"
+    ofi_score: float = 0.0
+    timeframes_analyzed: List[str] = None
+
+    def __post_init__(self):
+        if self.timeframes_analyzed is None:
+            self.timeframes_analyzed = []
 
 class SignalGenerator:
     calculate_volatility_squeeze = staticmethod(calculate_volatility_squeeze)
@@ -28,6 +37,120 @@ class SignalGenerator:
 
     def __init__(self, config: Any = None):
         self.config = config
+
+    @staticmethod
+    def calculate_cvd(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray) -> np.ndarray:
+        """Calculate Cumulative Volume Delta (CVD) based on intra-bar price action and volume."""
+        n = len(close)
+        cvd = np.zeros(n, dtype=float)
+        if n == 0:
+            return cvd
+        rng = high - low
+        safe_rng = np.where(rng > 0, rng, 1e-9)
+        buy_ratio = np.clip((close - low) / safe_rng, 0.0, 1.0)
+        delta_vol = volume * (2.0 * buy_ratio - 1.0)
+        cvd = np.cumsum(delta_vol)
+        return cvd
+
+    @staticmethod
+    def detect_cvd_divergence(close: np.ndarray, cvd: np.ndarray, lookback: int = 14) -> str:
+        """Detect bullish or bearish absorption divergence between price and CVD."""
+        if len(close) < lookback or len(cvd) < lookback:
+            return "NEUTRAL"
+        p_window = close[-lookback:]
+        cvd_window = cvd[-lookback:]
+        price_lower = p_window[-1] < np.min(p_window[:-1])
+        cvd_higher = cvd_window[-1] > np.min(cvd_window[:-1])
+        if price_lower and cvd_higher:
+            return "BULLISH_DIVERGENCE"
+        price_higher = p_window[-1] > np.max(p_window[:-1])
+        cvd_lower = cvd_window[-1] < np.max(cvd_window[:-1])
+        if price_higher and cvd_lower:
+            return "BEARISH_DIVERGENCE"
+        return "NEUTRAL"
+
+    @staticmethod
+    def calculate_vwap_bands(
+        high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray,
+        std_mults: Tuple[float, ...] = (1.0, 2.0, 3.0)
+    ) -> Dict[str, np.ndarray]:
+        """Calculate VWAP with standard deviation dispersion bands (±1σ, ±2σ, ±3σ)."""
+        typical_price = (high + low + close) / 3.0
+        cum_vol = np.cumsum(volume)
+        cum_pv = np.cumsum(typical_price * volume)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            vwap = np.where(cum_vol == 0, typical_price, cum_pv / cum_vol)
+        cum_sq_diff = np.cumsum(volume * (typical_price - vwap) ** 2)
+        variance = np.where(cum_vol == 0, 0.0, cum_sq_diff / cum_vol)
+        std_dev = np.sqrt(np.maximum(variance, 0.0))
+        bands = {"vwap": vwap, "std": std_dev}
+        for mult in std_mults:
+            bands[f"upper_{mult}"] = vwap + (mult * std_dev)
+            bands[f"lower_{mult}"] = vwap - (mult * std_dev)
+        return bands
+
+    @staticmethod
+    def calculate_squeeze_momentum(
+        high: np.ndarray, low: np.ndarray, close: np.ndarray,
+        bb_period: int = 20, bb_mult: float = 2.0,
+        kc_period: int = 20, kc_mult: float = 1.5
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Calculate TTM Squeeze state and momentum oscillator histogram."""
+        n = len(close)
+        is_squeeze = np.zeros(n, dtype=bool)
+        squeeze_fired = np.zeros(n, dtype=bool)
+        momentum = np.zeros(n, dtype=float)
+        if n < max(bb_period, kc_period):
+            return is_squeeze, squeeze_fired, momentum
+
+        sma = np.zeros(n, dtype=float)
+        stds = np.zeros(n, dtype=float)
+        pad = bb_period - 1
+        sma_valid = np.convolve(close, np.ones(bb_period) / bb_period, mode='valid')
+        sma[pad:] = sma_valid
+        sma[:pad] = close[:pad]
+        for i in range(pad, n):
+            stds[i] = np.std(close[i - pad : i + 1])
+        upper_bb = sma + (bb_mult * stds)
+        lower_bb = sma - (bb_mult * stds)
+
+        tr = np.zeros(n, dtype=float)
+        tr[0] = high[0] - low[0]
+        for i in range(1, n):
+            tr[i] = max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1]))
+        atr = np.zeros(n, dtype=float)
+        atr[0] = tr[0]
+        for i in range(1, n):
+            atr[i] = (atr[i - 1] * (kc_period - 1) + tr[i]) / kc_period
+
+        upper_kc = sma + (kc_mult * atr)
+        lower_kc = sma - (kc_mult * atr)
+
+        is_squeeze = (upper_bb < upper_kc) & (lower_bb > lower_kc)
+        for i in range(1, n):
+            squeeze_fired[i] = is_squeeze[i - 1] and not is_squeeze[i]
+
+        donchian_mid = np.zeros(n, dtype=float)
+        for i in range(pad, n):
+            donchian_mid[i] = (np.max(high[i - pad : i + 1]) + np.min(low[i - pad : i + 1])) / 2.0
+        delta = close - ((donchian_mid + sma) / 2.0)
+        momentum = delta
+        return is_squeeze, squeeze_fired, momentum
+
+    @staticmethod
+    def calculate_order_flow_imbalance(bids: Any, asks: Any, depth: int = 10) -> float:
+        """Calculate Order Flow Imbalance (OFI) from L2 orderbook bids and asks in [-1.0, 1.0]."""
+        if not bids or not asks:
+            return 0.0
+        try:
+            bid_vol = sum(float(b[1]) if isinstance(b, (list, tuple)) else float(b.get("size", 0)) for b in bids[:depth])
+            ask_vol = sum(float(a[1]) if isinstance(a, (list, tuple)) else float(a.get("size", 0)) for a in asks[:depth])
+            tot = bid_vol + ask_vol
+            if tot <= 0:
+                return 0.0
+            return float((bid_vol - ask_vol) / tot)
+        except Exception:
+            return 0.0
 
     @staticmethod
     def calculate_ema(prices: np.ndarray, period: int) -> np.ndarray:
@@ -439,6 +562,28 @@ class SignalGenerator:
         elif direction == "SHORT" and structure.nearest_support > 0.0 and structure.nearest_support < last_close:
             structural_target_tp = float(structure.nearest_support)
 
+        # Confluence Indicators: CVD, VWAP Bands, Squeeze Momentum
+        cvd_arr = self.calculate_cvd(hi, lo, cl, vol)
+        cvd_div = self.detect_cvd_divergence(cl, cvd_arr, lookback=14)
+
+        vwap_bands = self.calculate_vwap_bands(hi, lo, cl, vol, (1.0, 2.0, 3.0))
+        upper_2 = vwap_bands["upper_2.0"][-1] if len(vwap_bands["upper_2.0"]) > 0 else last_close * 1.01
+        lower_2 = vwap_bands["lower_2.0"][-1] if len(vwap_bands["lower_2.0"]) > 0 else last_close * 0.99
+        if last_close > upper_2:
+            vwap_band_level = "ABOVE_UPPER_2"
+        elif last_close < lower_2:
+            vwap_band_level = "BELOW_LOWER_2"
+        else:
+            vwap_band_level = "INSIDE"
+
+        is_sq, sq_fired, sq_mom = self.calculate_squeeze_momentum(hi, lo, cl)
+        squeeze_state = "FIRED" if (len(sq_fired) > 0 and sq_fired[-1]) else ("SQUEEZED" if (len(is_sq) > 0 and is_sq[-1]) else "NONE")
+
+        if direction == "LONG" and cvd_div == "BULLISH_DIVERGENCE":
+            strength = min(0.98, strength + 0.05)
+        elif direction == "SHORT" and cvd_div == "BEARISH_DIVERGENCE":
+            strength = min(0.98, strength + 0.05)
+
         is_breakout = setup_type in ("HTF_BREAKOUT", "BREAKOUT_RETEST", "VALUE_AREA_BREAKOUT")
         valid_setups = (
             "SWEEP_REVERSAL", "SWEEP_AND_FVG", "FVG_RETEST", 
@@ -464,6 +609,11 @@ class SignalGenerator:
             pattern=pattern,
             structural_target_tp=structural_target_tp,
             trap_wick_price=float(getattr(structure, "trap_wick_extreme", 0.0)),
+            cvd_divergence=cvd_div,
+            vwap_band_level=vwap_band_level,
+            squeeze_state=squeeze_state,
+            ofi_score=0.0,
+            timeframes_analyzed=["1m", "5m", "15m"],
         )
 
 
@@ -566,3 +716,11 @@ calculate_volatility_squeeze = SignalGenerator.calculate_volatility_squeeze
 compute_volatility_squeeze = SignalGenerator.calculate_volatility_squeeze
 calculate_volume_poc = SignalGenerator.compute_volume_poc
 compute_volume_poc = SignalGenerator.compute_volume_poc
+calculate_cvd = SignalGenerator.calculate_cvd
+compute_cvd = SignalGenerator.calculate_cvd
+calculate_vwap_bands = SignalGenerator.calculate_vwap_bands
+compute_vwap_bands = SignalGenerator.calculate_vwap_bands
+calculate_squeeze_momentum = SignalGenerator.calculate_squeeze_momentum
+compute_squeeze_momentum = SignalGenerator.calculate_squeeze_momentum
+calculate_order_flow_imbalance = SignalGenerator.calculate_order_flow_imbalance
+compute_order_flow_imbalance = SignalGenerator.calculate_order_flow_imbalance

@@ -121,6 +121,22 @@ class ScalpingBot:
         high_lev = getattr(target_lev, "high_leverage_value", 100) if target_lev else 100
         self.dashboard = Dashboard(mode=mode, target_leverage=high_lev)
 
+        # ---- Parallel Scanner & Worker Sub-Agents ----
+        from src.strategy.parallel_scanner import ParallelScanner
+        weights = getattr(getattr(self.config.strategy, "scanner", None), "score_weights", None)
+        weights_dict = weights.model_dump() if (weights and hasattr(weights, "model_dump")) else None
+        max_workers = getattr(getattr(self.config.strategy, "parallel_scanner", None), "max_concurrent_workers", 10)
+        self.parallel_scanner = ParallelScanner(
+            universe=target_symbols,
+            candle_store=self.candle_store,
+            market_structure=self.market_structure,
+            signal_generator=self.signal_generator,
+            delta_client=self.delta_client,
+            delta_ws=self.delta_ws,
+            weights=weights_dict,
+            max_concurrent_workers=max_workers,
+        )
+
         # ---- State ----
         self._last_scan_time: float = 0.0
         self._best_signal: dict[str, Any] | None = None
@@ -614,42 +630,44 @@ class ScalpingBot:
                 except Exception as e:
                     logger.debug(f"Failed to evaluate Jev market regime: {e}")
 
-        for symbol in universe:
-            candles_15m = self.delta_ws.candle_store.get_candles(symbol, "15m")
-            candles_5m = self.delta_ws.candle_store.get_candles(symbol, "5m")
+        # Concurrent Multi-Worker Parallel Scan across universe
+        evaluations_raw = await self.parallel_scanner.scan(universe)
+
+        # Cross-Asset SMT Divergence via Jev System One
+        if self.config.strategy.jev.enabled and self.jev_client.enabled and len(evaluations_raw) >= 2:
+            btc_e = next((e for e in evaluations_raw if "BTC" in e.symbol), None)
+            eth_e = next((e for e in evaluations_raw if "ETH" in e.symbol), None)
+            if btc_e and eth_e:
+                try:
+                    smt_res = await self.jev_client.evaluate_cross_asset_smt(
+                        asset_a="BTCUSD",
+                        asset_b="ETHUSD",
+                        a_higher_high=bool(getattr(btc_e.structure, "bos_5m", False) and getattr(btc_e.structure, "bos_direction_5m", "") == "BULLISH"),
+                        b_higher_high=bool(getattr(eth_e.structure, "bos_5m", False) and getattr(eth_e.structure, "bos_direction_5m", "") == "BULLISH"),
+                        a_lower_low=bool(getattr(btc_e.structure, "bos_5m", False) and getattr(btc_e.structure, "bos_direction_5m", "") == "BEARISH"),
+                        b_lower_low=bool(getattr(eth_e.structure, "bos_5m", False) and getattr(eth_e.structure, "bos_direction_5m", "") == "BEARISH"),
+                    )
+                    if smt_res and smt_res.smt_divergence_detected >= 0.70:
+                        logger.info(f"[JEV SMT] Divergence detected: {smt_res.reason} (Favored: {smt_res.favored_asset})")
+                except Exception as ex:
+                    logger.debug(f"Cross-asset SMT check failed: {ex}")
+
+        for eval_res in evaluations_raw:
+            symbol = eval_res.symbol
+            sig = eval_res.signal
+            structure = eval_res.structure
+            score = eval_res.score
+            current_atr = eval_res.current_atr
+            cur_p = eval_res.current_price
+            arr_1m = eval_res.raw_arrays.get("1m", {})
             candles_1m = self.delta_ws.candle_store.get_candles(symbol, "1m")
-
-            if len(candles_15m) < 50 or len(candles_5m) < 50 or len(candles_1m) < 50:
-                continue
-
-            arr_15m = candles_to_arrays(candles_15m)
-            arr_5m = candles_to_arrays(candles_5m)
-            arr_1m = candles_to_arrays(candles_1m)
-
-            atr_values = compute_atr(arr_1m["high"], arr_1m["low"], arr_1m["close"],
-                                     self.config.strategy.indicators.atr_period)
-            current_atr = float(atr_values[-1]) if len(atr_values) > 0 else 0.0
-
-            htf_levels = self.delta_ws.get_htf_levels(symbol) if hasattr(self, "delta_ws") and self.delta_ws else None
-            try:
-                structure = self.market_structure.analyze(
-                    arr_15m, arr_5m, arr_1m, current_atr, htf_levels=htf_levels
-                )
-            except Exception:
-                logger.debug(f"Structure analysis failed for {symbol}", exc_info=True)
-                continue
-
-            try:
-                sig = self.signal_generator.generate(
-                    arr_15m, arr_5m, arr_1m, structure
-                )
-            except Exception:
-                logger.debug(f"Signal generation failed for {symbol}", exc_info=True)
-                continue
+            htf_levels = self.delta_ws.get_htf_levels(symbol) if hasattr(self, "delta_ws") and self.delta_ws else {}
 
             adx_values = compute_adx(arr_1m["high"], arr_1m["low"], arr_1m["close"],
                                      self.config.strategy.indicators.adx_period)
             current_adx = float(adx_values[-1]) if len(adx_values) > 0 else 0.0
+            atr_values = compute_atr(arr_1m["high"], arr_1m["low"], arr_1m["close"],
+                                     self.config.strategy.indicators.atr_period)
             avg_atr = float(np.mean(atr_values[-20:])) if len(atr_values) >= 20 else current_atr
 
             regime = self.regime_filter.evaluate(current_adx, current_atr, avg_atr)

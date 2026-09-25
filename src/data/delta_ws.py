@@ -221,24 +221,24 @@ class DeltaWSClient:
         res_map = {
             "5s": 5, "15s": 15, "30s": 30,
             "1m": 60, "3m": 180, "5m": 300,
-            "15m": 900, "30m": 1800,
+            "15m": 900, "30m": 1800, "45m": 2700,
             "1h": 3600, "2h": 7200, "4h": 14400,
             "1d": 86400, "1w": 604800,
         }
         return res_map.get(resolution, 60)
 
     @staticmethod
-    def synthesize_sub_minute_candles(
-        candles_5s: List[Candle], target_seconds: int = 15
+    def synthesize_candles_from_base(
+        base_candles: List[Candle], target_seconds: int
     ) -> List[Candle]:
-        """Synthesize sub-minute candles (e.g. 15s, 30s) from raw 5s candles."""
-        if not candles_5s or target_seconds <= 5:
-            return candles_5s
+        """Synthesize higher-timeframe candles from base candles (e.g. 3m from 1m, 45m from 15m)."""
+        if not base_candles or target_seconds <= 0:
+            return base_candles
 
         target_ms = target_seconds * 1000
         buckets: Dict[int, List[Candle]] = {}
 
-        for c in candles_5s:
+        for c in base_candles:
             bucket_key = (c.open_time // target_ms) * target_ms
             if bucket_key not in buckets:
                 buckets[bucket_key] = []
@@ -262,6 +262,40 @@ class DeltaWSClient:
             synthesized.append(synth)
 
         return synthesized
+
+    @staticmethod
+    def synthesize_micro_candles_from_1m(candles_1m: List[Candle]) -> List[Candle]:
+        """Interpolate 1m candles into 5s synthetic candles to bootstrap micro timeframes."""
+        micro_5s = []
+        for c in candles_1m:
+            base_time = c.open_time
+            n_sub = 12
+            prices = np.linspace(c.open, c.close, n_sub)
+            vol_per_bar = c.volume / n_sub if n_sub > 0 else 0.0
+            for i in range(n_sub):
+                bar_time = base_time + (i * 5000)
+                sub_open = prices[i - 1] if i > 0 else c.open
+                sub_close = prices[i]
+                sub_high = max(sub_open, sub_close, c.high if i == n_sub // 2 else max(sub_open, sub_close))
+                sub_low = min(sub_open, sub_close, c.low if i == n_sub // 4 else min(sub_open, sub_close))
+                micro_5s.append(Candle(
+                    open_time=bar_time,
+                    open=float(sub_open),
+                    high=float(sub_high),
+                    low=float(sub_low),
+                    close=float(sub_close),
+                    volume=float(vol_per_bar),
+                    close_time=bar_time + 5000,
+                    is_closed=True,
+                ))
+        return micro_5s
+
+    @staticmethod
+    def synthesize_sub_minute_candles(
+        candles_5s: List[Candle], target_seconds: int = 15
+    ) -> List[Candle]:
+        """Synthesize sub-minute candles (e.g. 15s, 30s) from raw 5s candles."""
+        return DeltaWSClient.synthesize_candles_from_base(candles_5s, target_seconds)
 
     @staticmethod
     def _normalize_time_to_ms(t_val: Any) -> int:
@@ -312,6 +346,69 @@ class DeltaWSClient:
                     close_price = float(payload.get("close", 0.0))
                     if close_price > 0:
                         self._latest_prices[symbol] = close_price
+                        # Real-time sub-minute 5s candle synthesis from live ticks
+                        now_ms = int(time.time() * 1000)
+                        bucket_5s = (now_ms // 5000) * 5000
+                        key_5s = (symbol, "5s")
+                        existing_5s = self._forming_candles.get(key_5s)
+                        if existing_5s is not None:
+                            if bucket_5s > existing_5s.open_time:
+                                existing_5s.is_closed = True
+                                seen_key = (symbol, "5s", existing_5s.open_time)
+                                if seen_key not in self._seen_candles:
+                                    self._seen_candles.add(seen_key)
+                                    self.store.add_candle(symbol, "5s", existing_5s)
+                                    self.new_candle_event.set()
+                                for synth_sec in (15, 30):
+                                    synth_tf = f"{synth_sec}s"
+                                    synth_bucket = (existing_5s.open_time // (synth_sec * 1000)) * (synth_sec * 1000)
+                                    s_key = (symbol, synth_tf)
+                                    s_existing = self._forming_candles.get(s_key)
+                                    if s_existing is None or s_existing.open_time < synth_bucket:
+                                        if s_existing is not None:
+                                            s_existing.is_closed = True
+                                            self.store.add_candle(symbol, synth_tf, s_existing)
+                                        self._forming_candles[s_key] = Candle(
+                                            open_time=synth_bucket,
+                                            open=existing_5s.open,
+                                            high=existing_5s.high,
+                                            low=existing_5s.low,
+                                            close=existing_5s.close,
+                                            volume=existing_5s.volume,
+                                            close_time=synth_bucket + (synth_sec * 1000),
+                                            is_closed=False,
+                                        )
+                                    else:
+                                        s_existing.high = max(s_existing.high, existing_5s.high)
+                                        s_existing.low = min(s_existing.low, existing_5s.low)
+                                        s_existing.close = existing_5s.close
+                                        s_existing.volume += existing_5s.volume
+
+                                self._forming_candles[key_5s] = Candle(
+                                    open_time=bucket_5s,
+                                    open=close_price,
+                                    high=close_price,
+                                    low=close_price,
+                                    close=close_price,
+                                    volume=0.0,
+                                    close_time=bucket_5s + 5000,
+                                    is_closed=False
+                                )
+                            else:
+                                existing_5s.high = max(existing_5s.high, close_price)
+                                existing_5s.low = min(existing_5s.low, close_price)
+                                existing_5s.close = close_price
+                        else:
+                            self._forming_candles[key_5s] = Candle(
+                                open_time=bucket_5s,
+                                open=close_price,
+                                high=close_price,
+                                low=close_price,
+                                close=close_price,
+                                volume=0.0,
+                                close_time=bucket_5s + 5000,
+                                is_closed=False
+                            )
                 except (ValueError, TypeError):
                     pass
 
@@ -397,6 +494,58 @@ class DeltaWSClient:
                                     s_existing.low = min(s_existing.low, existing.low)
                                     s_existing.close = existing.close
                                     s_existing.volume += existing.volume
+
+                        if resolution == "1m":
+                            synth_sec = 180  # 3m
+                            synth_tf = "3m"
+                            synth_bucket = (existing.open_time // (synth_sec * 1000)) * (synth_sec * 1000)
+                            s_key = (symbol, synth_tf)
+                            s_existing = self._forming_candles.get(s_key)
+                            if s_existing is None or s_existing.open_time < synth_bucket:
+                                if s_existing is not None:
+                                    s_existing.is_closed = True
+                                    self.store.add_candle(symbol, synth_tf, s_existing)
+                                self._forming_candles[s_key] = Candle(
+                                    open_time=synth_bucket,
+                                    open=existing.open,
+                                    high=existing.high,
+                                    low=existing.low,
+                                    close=existing.close,
+                                    volume=existing.volume,
+                                    close_time=synth_bucket + (synth_sec * 1000),
+                                    is_closed=False,
+                                )
+                            else:
+                                s_existing.high = max(s_existing.high, existing.high)
+                                s_existing.low = min(s_existing.low, existing.low)
+                                s_existing.close = existing.close
+                                s_existing.volume += existing.volume
+
+                        if resolution == "15m":
+                            synth_sec = 2700  # 45m
+                            synth_tf = "45m"
+                            synth_bucket = (existing.open_time // (synth_sec * 1000)) * (synth_sec * 1000)
+                            s_key = (symbol, synth_tf)
+                            s_existing = self._forming_candles.get(s_key)
+                            if s_existing is None or s_existing.open_time < synth_bucket:
+                                if s_existing is not None:
+                                    s_existing.is_closed = True
+                                    self.store.add_candle(symbol, synth_tf, s_existing)
+                                self._forming_candles[s_key] = Candle(
+                                    open_time=synth_bucket,
+                                    open=existing.open,
+                                    high=existing.high,
+                                    low=existing.low,
+                                    close=existing.close,
+                                    volume=existing.volume,
+                                    close_time=synth_bucket + (synth_sec * 1000),
+                                    is_closed=False,
+                                )
+                            else:
+                                s_existing.high = max(s_existing.high, existing.high)
+                                s_existing.low = min(s_existing.low, existing.low)
+                                s_existing.close = existing.close
+                                s_existing.volume += existing.volume
 
                         # Start new forming candle
                         self._forming_candles[key] = Candle(
@@ -545,13 +694,41 @@ class DeltaWSClient:
                 elif isinstance(res, Exception):
                     logger.debug(f"Historical candle task failed: {res}")
 
-        # If 5s candles were bootstrapped, automatically synthesize 15s and 30s candles
+        # Synthesize missing timeframes (3m, 45m, and sub-minute candles)
         for sym in self.symbols:
-            c_5s = self.store.get_candles(sym, "5s")
-            if c_5s:
+            c_1m = self.store.get_candles(sym, "1m")
+            if c_1m:
+                # 1. Synthesize 3m candles from 1m
+                synth_3m = self.synthesize_candles_from_base(c_1m, target_seconds=180)
+                for sc in synth_3m:
+                    self.store.add_candle(sym, "3m", sc)
+                    self._seen_candles.add((sym, "3m", sc.open_time))
+                total_bootstrapped += len(synth_3m)
+
+                # 2. If 5s candles are not populated via REST, bootstrap micro candles from 1m
+                c_5s = self.store.get_candles(sym, "5s")
+                if not c_5s:
+                    synth_5s = self.synthesize_micro_candles_from_1m(c_1m[-100:])
+                    for sc in synth_5s:
+                        self.store.add_candle(sym, "5s", sc)
+                        self._seen_candles.add((sym, "5s", sc.open_time))
+                    total_bootstrapped += len(synth_5s)
+
+            c_15m = self.store.get_candles(sym, "15m")
+            if c_15m:
+                # 3. Synthesize 45m candles from 15m
+                synth_45m = self.synthesize_candles_from_base(c_15m, target_seconds=2700)
+                for sc in synth_45m:
+                    self.store.add_candle(sym, "45m", sc)
+                    self._seen_candles.add((sym, "45m", sc.open_time))
+                total_bootstrapped += len(synth_45m)
+
+            # 4. Synthesize 15s and 30s from 5s
+            c_5s_now = self.store.get_candles(sym, "5s")
+            if c_5s_now:
                 for target_sec in (15, 30):
                     synth_tf = f"{target_sec}s"
-                    synth_candles = self.synthesize_sub_minute_candles(c_5s, target_seconds=target_sec)
+                    synth_candles = self.synthesize_sub_minute_candles(c_5s_now, target_seconds=target_sec)
                     for sc in synth_candles:
                         self.store.add_candle(sym, synth_tf, sc)
                         self._seen_candles.add((sym, synth_tf, sc.open_time))

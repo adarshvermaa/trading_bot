@@ -85,7 +85,23 @@ class RiskManager:
         pricing_zone: Optional[str] = None,
         equity: float = 10000.0,
     ) -> DynamicLeverageResult:
-        """Calculate dynamic leverage based on market confluence and AI confidence."""
+        """Calculate leverage anchored strictly at fixed 25x or dynamic if explicitly enabled."""
+        if not getattr(getattr(self.config, "dynamic_leverage", None), "enabled", False):
+            fixed_lev = int(getattr(getattr(self.config, "leverage", None), "fixed_leverage", 25))
+            actual_lev = int(min(fixed_lev, exchange_max_leverage))
+            return DynamicLeverageResult(
+                leverage=actual_lev,
+                tier="FIXED_25X",
+                effective_confidence=1.0,
+                market_confidence=1.0,
+                ai_confidence=1.0,
+                volatility_dampener=1.0,
+                drawdown_dampener=1.0,
+                liquidation_buffer_ratio=2.5,
+                max_safe_leverage=actual_lev,
+                rationale="Fixed 25x Isolated Scalper Leverage",
+            )
+
         max_daily_loss = equity * getattr(self.config.daily_limits, "max_daily_loss_pct", 0.03)
         return self.dynamic_leverage_engine.evaluate_leverage(
             symbol=symbol,

@@ -50,6 +50,11 @@ class IndicatorConfig(BaseModel):
     adx_threshold: float = 25.0
     relative_volume_period: int = 20
     relative_volume_threshold: float = 1.5
+    cvd_period: int = 20
+    vwap_stds: list[float] = Field(default_factory=lambda: [1.0, 2.0, 3.0])
+    squeeze_bb_mult: float = 2.0
+    squeeze_kc_mult: float = 1.5
+    ofi_threshold: float = 0.25
 
 
 class StructureConfig(BaseModel):
@@ -132,13 +137,23 @@ class JevConfig(BaseModel):
     trailing_interval_seconds: int = 5
 
 
+class ParallelScannerConfig(BaseModel):
+    enabled: bool = True
+    max_concurrent_workers: int = 10
+    worker_timeout_seconds: float = 3.0
+    enable_parallel_indicators: bool = True
+
+
 class StrategyConfig(BaseModel):
     assets: AssetConfig = Field(default_factory=AssetConfig)
-    timeframes: list[str] = Field(default_factory=lambda: ["15m", "5m", "1m"])
+    timeframes: list[str] = Field(default_factory=lambda: [
+        "5s", "15s", "30s", "1m", "3m", "5m", "15m", "30m", "45m", "1h", "4h", "1d"
+    ])
     indicators: IndicatorConfig = Field(default_factory=IndicatorConfig)
     structure: StructureConfig = Field(default_factory=StructureConfig)
     ml: MLConfig = Field(default_factory=MLConfig)
     scanner: ScannerConfig = Field(default_factory=ScannerConfig)
+    parallel_scanner: ParallelScannerConfig = Field(default_factory=ParallelScannerConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     session: SessionConfig = Field(default_factory=SessionConfig)
     breakout: BreakoutConfig = Field(default_factory=BreakoutConfig)
@@ -156,7 +171,10 @@ class CapitalConfig(BaseModel):
 
 
 class LeverageConfig(BaseModel):
-    high_leverage_assets: list[str] = Field(default_factory=lambda: ["BTCUSD", "ETHUSD"])
+    high_leverage_assets: list[str] = Field(default_factory=lambda: [
+        "BTCUSD", "ETHUSD", "SOLUSD", "XAUTUSD", "PAXGUSD", "DOGEUSD", "XRPUSD", "BNBUSD", "AVAXUSD"
+    ])
+    fixed_leverage: int = 25
     high_leverage_value: int = 25
     default_leverage_value: int = 20
     safe_fallback_leverage: int = 10
@@ -172,6 +190,7 @@ class DynamicLeverageTiersConfig(BaseModel):
 
 class DynamicLeverageConfig(BaseModel):
     enabled: bool = True
+    fixed_leverage: int = 25
     min_leverage: int = 5
     max_leverage: int = 50
     tiers: DynamicLeverageTiersConfig = Field(default_factory=DynamicLeverageTiersConfig)
@@ -184,11 +203,15 @@ class DynamicLeverageConfig(BaseModel):
 class StopLossConfig(BaseModel):
     max_loss_pct_of_margin: float = 0.03
     min_stop_distance_atr: float = 0.05
+    liquidation_buffer_ratio: float = 1.5
 
 
 class TakeProfitConfig(BaseModel):
     target_pct_of_margin: float = 2.00
     target_pct_of_margin_max: float = 2.00
+    min_risk_reward_ratio: float = 1.8
+    target_risk_reward_ratio: float = 2.5
+    max_risk_reward_ratio: float = 3.5
 
 
 class TrailingStopConfig(BaseModel):

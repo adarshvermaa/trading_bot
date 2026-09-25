@@ -3,12 +3,12 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform: Delta Exchange](https://img.shields.io/badge/Exchange-Delta_India-orange.svg)](https://india.delta.exchange)
-[![Tests: Pytest](https://img.shields.io/badge/Tests-237%20Passed-brightgreen.svg)]()
+[![Tests: Pytest](https://img.shields.io/badge/Tests-254%20Passed-brightgreen.svg)]()
 [![Code Style: Black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 An institutional-grade, autonomous CLI cryptocurrency trading bot designed for **Delta Exchange India** (Crypto & Gold Futures). 
 
-Engineered with a confluence-driven architecture combining **ICT / Smart Money Concepts**, a **TradingView Chart Pattern Engine**, **TypeSafe Jev AI (System One) Cognitive Reasoning**, **Dynamic Leverage (10x–50x)**, and an interactive **Rich Terminal Dashboard UI**.
+Engineered with a confluence-driven architecture combining **ICT / Smart Money Concepts**, **TypeSafe Jev AI (System One) Cognitive Reasoning**, a **Parallel Async Multi-Asset Scanner**, **Fixed 25x Leverage with Dynamic Risk:Reward Calibration**, and an interactive **Rich Terminal Dashboard UI**.
 
 ---
 
@@ -16,9 +16,12 @@ Engineered with a confluence-driven architecture combining **ICT / Smart Money C
 
 - [Key Capabilities](#-key-capabilities)
 - [Architecture Flow](#-architecture-flow)
-- [Trading Strategy & Profiles](#-trading-strategy--profiles)
+- [Trading Strategy: Pure Scalper Architecture](#-trading-strategy-pure-scalper-architecture)
+- [11 Granular Multi-Timeframe Analysis](#-11-granular-multi-timeframe-analysis)
+- [Parallel Sub-Worker Scanner Architecture](#-parallel-sub-worker-scanner-architecture)
+- [Advanced Confluence Indicators](#-advanced-confluence-indicators)
 - [TypeSafe Jev AI (System One) Integration](#-typesafe-jev-ai-system-one-integration)
-- [Dynamic Leverage & Risk Controls](#-dynamic-leverage--risk-controls)
+- [Fixed 25x Leverage & Risk Management](#-fixed-25x-leverage--risk-management)
 - [Installation & Quickstart](#-installation--quickstart)
 - [Configuration Guide](#-configuration-guide)
   - [Environment Variables (.env)](#1-environment-variables-env)
@@ -36,24 +39,26 @@ Engineered with a confluence-driven architecture combining **ICT / Smart Money C
 - **Native Delta Exchange India Integration**:
   - Sub-millisecond REST and WebSocket data feeds directly connected to Delta Exchange India (`api.india.delta.exchange`).
   - Supports Crypto & Commodity Futures: `BTCUSD`, `ETHUSD`, `SOLUSD`, `XAUTUSD` (Tether Gold), `PAXGUSD`, `DOGEUSD`, `XRPUSD`, `BNBUSD`, `AVAXUSD`, `ZECUSD`.
-  - Automated candle bootstrapping up to 24,000 historical candles across 1m, 5m, 15m, 1h, and 4h timeframes.
-- **ICT & Smart Money Concepts Engine**:
-  - **Market Structure**: Multi-timeframe Break of Structure (BOS), Change of Character (CHoCH), and swing high/low tracking.
-  - **Institutional Zones**: Order Blocks (OB), Fair Value Gaps (FVG), Volume Point of Control (POC), Value Area High/Low (VAH/VAL), Equal Highs/Lows (EQH/EQL), and Asian Session Range (00:00–08:00 UTC).
-  - **Dealing Range Matrix**: Algorithmic classification into **DISCOUNT** ($<45\%$, institutional buying), **PREMIUM** ($>55\%$, institutional selling), or **EQUILIBRIUM**.
-- **TradingView Chart Pattern Engine**:
-  - Algorithmic recognition of classic price action patterns: **Double Bottom (W)**, **Double Top (M)**, **Head & Shoulders**, **Inverse H&S**, and **Carter Volatility Squeezes** (Bollinger inside Keltner Channel compression).
-  - Four institutional playbooks: `ICT_JUDAS_SWEEP`, `ORDER_BLOCK_FVG_PULLBACK`, `CARTER_SQUEEZE_BREAKOUT`, and `VALUE_AREA_MEAN_REVERSION`.
-- **TypeSafe Jev AI (System One) Cognitive Model**:
-  - **Pre-Trade Gatekeeper**: Analyzes macro narrative, structure integrity, trap probability ($<0.35$ filter), and setup grade ($0.0$ to $4.0$).
-  - **Asymmetric Targets**: Dynamically calibrates structural take-profit and stop-loss targets with guaranteed $\ge 2.5\text{R}$ up to $5.0\text{R}$ multiples.
-  - **Active Trade Guardian**: Continuously monitors trade health, momentum degradation, and structural breakdown to trigger emergency cuts.
-  - **Pattern Memory & Forensics**: Automatically fingerprints winning and losing trades into a local vector database to prevent repeating historical mistakes.
-- **Dynamic Leverage Engine**:
-  - Dynamic position sizing and leverage calibration across 4 tiers: **Win-Win Apex (50x)**, **High Conviction (30x)**, **Standard Scalp (20x)**, and **Defensive Probe (10x)**.
-  - **Liquidation Cushion Guarantee**: Enforces that liquidation distance is strictly $\ge 1.5\times$ to $1.8\times$ the stop-loss distance.
-- **Rich Terminal Dashboard UI**:
-  - Interactive live dashboard featuring real-time multi-asset ranking, radar technical matrix, SMT cross-asset divergence alerts, orderbook imbalance (OBI), and live unrealized PnL.
+  - Automated candle bootstrapping and real-time synthesis across **11 granular timeframes**: `5s`, `15s`, `30s`, `1m`, `3m`, `5m`, `15m`, `30m`, `45m`, `1h`, `4h`, `1d`.
+- **Pure Scalper Focus**:
+  - Exclusively built for high-velocity scalping (max holding 15m–29m) to capitalize on intraday order flow and Delta Exchange's **0-fee maker exit offer** (positions closed under 29 minutes incur 0 maker fees on `BTCUSD` and `ETHUSD`).
+- **Parallel Sub-Worker Scanner**:
+  - High-throughput asynchronous `AssetWorker` agents scanning each instrument concurrently via `asyncio.gather()` and bounded with `asyncio.Semaphore`.
+  - Zero-latency sorting and ranking of the most profitable confluence opportunities.
+- **Fixed 25x Leverage with Dynamic Risk:Reward**:
+  - Anchored leverage at **25x** for deterministic capital efficiency.
+  - Dynamically calculates asymmetric profit targets ($1.8\text{R}$ up to $3.5\text{R}$) based on institutional liquidity targets and market volatility.
+  - Strict liquidation cushion guarantee: liquidation distance is mathematically enforced at $\ge 1.5\times$ to $2.5\times$ the stop-loss distance.
+- **Advanced Confluence Indicators**:
+  - **Cumulative Volume Delta (CVD)** & absorption divergence detection.
+  - **VWAP Standard Deviation Bands** ($\pm 1\sigma, \pm 2\sigma, \pm 3\sigma$).
+  - **TTM Squeeze Momentum** (Bollinger Bands compression inside Keltner Channels).
+  - **Order Flow Imbalance (OFI)** from live L2 orderbook bid/ask depth.
+- **TypeSafe Jev AI (System One) Cognitive Copilot**:
+  - **Pre-Trade Gatekeeper**: Rigorous cognitive audit evaluating trap probability ($<0.35$ filter), liquidity pools, and setup grade ($0.0$ to $4.0$).
+  - **Cross-Asset SMT Divergence**: Correlates institutional smart money divergence between BTC and ETH.
+  - **Active Scalp Guardian**: Sub-second health assessment (stops momentum degradation, trailing stops to breakeven at $+1.2\text{R}$, locking runners at $+2.0\text{R}$).
+  - **Pattern Memory Forensics**: Local vector memory preventing repetition of historically failed setups.
 
 ---
 
@@ -61,69 +66,102 @@ Engineered with a confluence-driven architecture combining **ICT / Smart Money C
 
 ```mermaid
 flowchart TD
-    subgraph DATA["Data & Feed Layer"]
-        A["Delta Exchange WebSocket"] --> B["CandleStore (1m, 5m, 15m, 1h, 4h)"]
-        A --> C["L2 Orderbook (Best Bid / Ask / OBI)"]
+    subgraph DATA["Data & Real-Time Synthesis Layer"]
+        A["Delta Exchange WebSocket (Ticker + L2)"] --> B["CandleStore: 5s, 15s, 30s, 1m, 3m, 5m, 15m, 30m, 45m, 1h, 4h, 1d"]
+        A --> C["L2 Orderbook Depth (OFI & Bid/Ask Imbalance)"]
         D["Delta REST Bootstrapper"] --> B
     end
 
-    subgraph TA["Strategy & Pattern Layer"]
-        B --> E["MarketStructure (BOS, CHoCH, OB, FVG, S/R)"]
-        B --> F["ChartPatternEngine (Double Tops/Bottoms, Squeezes)"]
-        B --> G["SignalGenerator (EMA 20/50, VWAP, RSI, ATR, ADX)"]
-        E & F & G --> H["Candidate Confluence Signal"]
+    subgraph PARALLEL["Parallel Async Multi-Worker Scanner"]
+        B & C --> E1["AssetWorker: BTCUSD"]
+        B & C --> E2["AssetWorker: ETHUSD"]
+        B & C --> E3["AssetWorker: SOLUSD / Altcoins"]
+        E1 & E2 & E3 --> F["ParallelScanner: Rank by Confluence & Jev SMT"]
     end
 
-    subgraph JEV["Jev AI (System One) Cognitive Layer"]
-        H --> I["Pattern Memory Advisory (Cosine Similarity)"]
-        I --> J["Jev evaluate_pre_trade_setup()"]
-        J --> K{"Jev Verdict"}
-        K -- "Trap Prob >= 0.35 or Divergent" --> L["VETO (Trade Blocked)"]
-        K -- "Grade >= 3.3 & Aligned" --> M["BOOST Trade Confluence"]
-        K -- "Valid Confluence" --> N["PASS (Grade >= 2.5)"]
+    subgraph TA["Confluence & Indicator Engine"]
+        F --> G1["CVD & Volume Absorption Divergence"]
+        F --> G2["VWAP ±1σ, ±2σ, ±3σ Deviation Bands"]
+        F --> G3["TTM Squeeze Momentum Compression"]
+        F --> G4["ICT Structure: BOS, CHoCH, Order Blocks, FVGs"]
     end
 
-    subgraph RISK["Dynamic Leverage & Risk Layer"]
-        M & N --> O["DynamicLeverageEngine (10x - 50x)"]
-        O --> P["Liquidation Safety Cushion Check (>= 1.8x SL)"]
-        P --> Q["RiskManager: Position Sizing & Margin Allocation"]
+    subgraph JEV["TypeSafe Jev AI (System One) Cognitive Model"]
+        G1 & G2 & G3 & G4 --> H["Pre-Trade Cognitive Audit"]
+        H --> I{"Jev Verdict"}
+        I -- "Trap Prob >= 0.35 or SMT Clashing" --> J["VETO (Trade Blocked)"]
+        I -- "Confluence Grade >= 2.5" --> K["PASS & Structural Target Extraction"]
+    end
+
+    subgraph RISK["Fixed 25x Leverage & Risk Controls"]
+        K --> L["Fixed 25x Leverage Engine"]
+        L --> M["Liquidation Cushion Invariant (>= 1.5x - 2.5x SL)"]
+        M --> N["Dynamic Risk:Reward (1.8R - 3.5R Target)"]
     end
 
     subgraph EXEC["Execution & Order Lifecycle"]
-        Q --> R["OrderManager: Delta Bracket Order (Atomic SL/TP)"]
-        R --> S["Active Position Lifespan Monitor"]
-        S --> T{"+1.2R Profit Achieved?"}
-        T -- "YES" --> U["Ratchet SL to Breakeven (+0.1R)"]
-        S --> V{"+2.0R Profit Achieved?"}
-        V -- "YES" --> W["Lock Runner Profit (>= +1.0R Trail)"]
-        S --> X["Delta Zero-Fee Optimization (29m Close)"]
+        N --> O["OrderManager: Delta Bracket Order (Atomic SL/TP)"]
+        O --> P["Active Scalp Monitor (<29m Delta Zero-Fee Close)"]
+        P --> Q["Trailing Ratchet: +1.2R -> Breakeven, +2.0R -> Lock Runner"]
     end
 ```
 
 ---
 
-## 🎯 Trading Strategy & Profiles
+## 🎯 Trading Strategy: Pure Scalper Architecture
 
-The bot supports two distinct operational profiles configurable via CLI (`--profile`) or `config/strategy.yaml`:
+The bot is strictly engineered as a **Pure Scalper**:
 
-### 1. High-Frequency Scalp Profile (`scalp`)
-- **Focus**: Fast session momentum scalping on 1m, 5m, and 15m charts.
-- **Holding Window**: 3 to 29 minutes.
-- **Target R:R**: $1.5\text{R}$ to $2.5\text{R}$.
-- **Delta Fee Arbitrage**: Optimizes trade closes before 29 minutes on `BTCUSD` and `ETHUSD` to take advantage of Delta Exchange's zero-fee maker closing offer.
-- **Dynamic Leverage**: Up to **50x** on highest-conviction apex setups.
+- **Execution Focus**: Fast micro-momentum scalps and liquidity sweep reversals.
+- **Maximum Holding Period**: Up to **29 minutes** to exploit Delta Exchange's **0 maker fee policy** for rapid round-trips.
+- **Fixed Leverage**: **25x** across all assets, ensuring consistent risk modeling and predictability.
+- **Target Risk-to-Reward**: Dynamic between **$1.8\text{R}$ and $3.5\text{R}$**, governed by key structural liquidity pools (swing highs/lows, FVGs, and volume POC).
+- **Profit Protection**:
+  - Trailing stop triggers at $+1.2\text{R}$ profit to ratchet SL to breakeven ($+0.1\text{R}$).
+  - Locks in runner profits at $+2.0\text{R}$ with trailing ATR cushion.
+  - Emergency stall protection and delta absorption exits.
 
-### 2. Intraday Session Swing Profile (`intraday_swing`)
-- **Focus**: Institutional session expansion moves across London and New York sessions.
-- **Timeframe Hierarchy**:
-  - **4H/1D Macro Context**: Macro trend and dealing range positioning (**DISCOUNT** vs **PREMIUM**).
-  - **1H Intermediate Structure**: Institutional Order Blocks, Fair Value Gaps, and BOS confirmations.
-  - **5m/15m Precision Trigger**: Key level liquidity sweeps paired with $>70\%$ body-to-range displacement candles.
-- **Holding Window**: Strictly **1 hour (60m) minimum** up to **8 hours (480m) maximum**.
-- **1-Hour Thesis Immunity**: Suppresses premature micro-pullback momentum exits during the first 60 minutes, ensuring institutional expansion has room to develop while structural stop loss remains strictly enforced.
-- **8-Hour Sunset Close (`SESSION_8H_SUNSET_EXPIRY`)**: Flags warning at 7.5 hours and forces a flat exit at 8.0 hours to avoid multi-day exposure and Delta 8-hour funding rate resets.
-- **Target R:R**: Asymmetric $\ge 2.5\text{R}$ up to $4.0\text{R}$.
-- **Dynamic Leverage**: Conservative **10x to 25x safe cushion**.
+---
+
+## ⏱️ 11 Granular Multi-Timeframe Analysis
+
+The bot analyzes market structure and momentum across 11 synchronized timeframes:
+
+| Category | Timeframes | Purpose |
+| :--- | :--- | :--- |
+| **Micro Triggers** | `5s`, `15s`, `30s` | Real-time tick absorption, instant order flow sweeps, micro entry timing. |
+| **Fast Execution** | `1m`, `3m`, `5m` | Primary signal trigger, displacement confirmation, Carter squeeze breakouts. |
+| **Intermediate Structure** | `15m`, `30m`, `45m` | Trend structure, Order Blocks, Fair Value Gaps (FVG), Volume Profile POC. |
+| **Macro Regime** | `1h`, `4h`, `1d` | Daily & weekly high/lows (PDH/PDL/PWH/PWL), Asian session range, macro bias. |
+
+Sub-minute candles (`5s`, `15s`, `30s`) and custom granular candles (`3m`, `45m`) are synthesized in real-time by `DeltaWSClient` from streaming trade ticks and 1m/15m base candles.
+
+---
+
+## ⚡ Parallel Sub-Worker Scanner Architecture
+
+To scan multiple crypto assets without blocking the event loop:
+1. Each asset runs in its own **`AssetWorker`** sub-agent instance.
+2. The worker computes vectorized indicators (CVD, VWAP bands, Squeeze momentum, RSI, EMA, ATR, ADX) and structural levels in parallel.
+3. **`ParallelScanner`** uses `asyncio.gather()` with `asyncio.Semaphore` throttling to evaluate the entire universe simultaneously.
+4. Assets are ranked by composite confluence score, and cross-asset SMT divergence (e.g. BTC vs ETH) is analyzed before capital allocation.
+
+---
+
+## 📊 Advanced Confluence Indicators
+
+- **Cumulative Volume Delta (CVD)**:
+  - Tracks the net aggressive buying vs selling volume intra-bar.
+  - Detects **absorption divergence**: price making lower lows while CVD makes higher lows indicates institutional accumulation (bullish entry).
+- **VWAP Standard Deviation Bands**:
+  - Computes continuous volume-weighted average price with $\pm 1\sigma, \pm 2\sigma, \pm 3\sigma$ dispersion bands.
+  - Used for mean reversion entries at statistical extremes ($\pm 2\sigma$ or $\pm 3\sigma$) and dynamic trailing targets.
+- **TTM Squeeze Momentum Oscillator**:
+  - Identifies volatility compression when Bollinger Bands (20, 2.0) contract inside Keltner Channels (20, 1.5).
+  - Fires explosive directional scalp entries when the squeeze releases.
+- **Order Flow Imbalance (OFI)**:
+  - Real-time bid/ask depth evaluation from Delta's L2 orderbook.
+  - Blocks entries if the order book is skewed against the trade direction.
 
 ---
 
@@ -147,21 +185,24 @@ Unlike conventional trading bots that rely solely on lagging indicators or rigid
 
 ---
 
-## 🛡️ Dynamic Leverage & Risk Controls
+## 🛡️ Fixed 25x Leverage & Dynamic Risk Controls
 
 Trading crypto derivatives requires rigorous capital preservation. The bot enforces strict mathematical risk limits:
 
-- **Dynamic Leverage Matrix**:
-  | Tier | Leverage Range | Minimum Confluence | Required Cushion |
-  | :--- | :---: | :---: | :---: |
-  | **Win-Win Apex** | 40x – 50x (Scalp) / 25x (Swing) | $\ge 90\%$ Confluence + Jev Boost | $\ge 1.8\times$ SL Distance |
-  | **High Conviction**| 25x – 35x (Scalp) / 20x (Swing) | $\ge 80\%$ Confluence | $\ge 1.8\times$ SL Distance |
-  | **Standard** | 15x – 20x (Scalp) / 15x (Swing) | $\ge 70\%$ Confluence | $\ge 1.6\times$ SL Distance |
-  | **Defensive Probe**| 5x – 10x | $\ge 60\%$ Confluence | $\ge 1.5\times$ SL Distance |
+- **Fixed 25x Leverage Architecture**:
+  - Leverage is deterministic and anchored to **25x** (`fixed_leverage = 25`).
+  - Eliminates uncontrolled leverage spikes while maximizing buying power efficiency within Delta Exchange's initial margin rules.
+  - Position sizing is dynamically calculated so total margin per trade does not exceed the configured capital allocation limit (default 80%, leaving 20% untouchable reserve).
 
-- **Liquidation Cushion Formula**:
-  $$\text{Liquidation Distance} \ge 1.8 \times \text{Stop Loss Distance}$$
-  If calculated leverage places the liquidation price inside this safety buffer, leverage is automatically dialed down to the safest compliant tier.
+- **Dynamic Risk-to-Reward (1.8R to 3.5R)**:
+  - Rather than scaling leverage up or down, the bot dynamically scales its **Risk:Reward targets**:
+    - **High-Velocity Micro Scenarios**: Targets nearest liquidity pool or EMA/VWAP confluence at $1.8\text{R}$ to $2.2\text{R}$.
+    - **Structural Breakout & Trend Continuation**: Targets opposing institutional Order Blocks or Volume POC at $2.5\text{R}$ up to $3.5\text{R}$.
+
+- **Liquidation Cushion Invariant**:
+  $$\text{Liquidation Distance} \ge 1.5 \times \text{Stop Loss Distance}$$
+  - A trade is rejected if the distance from entry to estimated liquidation price does not provide at least a $1.5\times$ (up to $2.5\times$) cushion beyond the stop-loss price.
+
 - **Circuit Breakers**:
   - **Max Daily Loss**: Trading terminates automatically if portfolio equity draws down by $\ge 3.0\%$ in 24 hours.
   - **Consecutive Loss Cooldown**: Enforces a 5-minute timeout after consecutive losing trades.
@@ -234,18 +275,19 @@ nano .env  # or vim, code, etc.
 | `LOG_DIR` | Output directory for structured JSON logs | `logs` | No |
 
 ### 2. Strategy Settings (`config/strategy.yaml`)
-- `profile`: Sets default active profile (`scalp` or `intraday_swing`).
-- `assets.universe`: Default list of scanned/traded instruments.
-- `assets.presets`: Presets such as `majors` (BTC, ETH), `top10` (top 10 liquid crypto + gold), and `gold` (XAUT, PAXG).
+- `profile`: Strictly anchored to `scalp`.
+- `assets.universe`: Default list of scanned/traded instruments (e.g. `BTCUSD`, `ETHUSD`, `SOLUSD`).
+- `timeframes`: Full 11-timeframe hierarchy (`5s`, `15s`, `30s`, `1m`, `3m`, `5m`, `15m`, `30m`, `45m`, `1h`, `4h`, `1d`).
+- `parallel_scanner`: Max concurrent worker sub-agents (`max_concurrent_workers: 10`) and confluence weights.
+- `indicators`: Config for EMA, RSI, ATR, ADX, CVD, VWAP standard deviation bands, and TTM Squeeze momentum.
 - `structure`: ICT swing lookbacks, wick sweep ratio, displacement threshold.
-- `breakout`: Bollinger & Keltner squeeze parameters, runner trailing targets.
-- `jev`: Model timeout, min confidence, max trap probability, dynamic SL/TP switches.
+- `jev`: Model timeout, min confidence, max trap probability ($0.35$), dynamic R:R switches.
 
 ### 3. Risk Settings (`config/risk.yaml`)
 - `capital.max_allocation_pct`: Maximum portfolio capital deployed per trade (e.g. `0.80` = 80%).
-- `leverage.high_leverage_value`: Base target leverage.
-- `dynamic_leverage.tiers`: Max leverage for each confluence tier.
-- `dynamic_leverage.liquidation_buffer_ratio`: Safety cushion multiplier relative to stop loss.
+- `capital.reserve_pct`: Untouchable reserve buffer (e.g. `0.20` = 20%).
+- `leverage.fixed_leverage`: Anchored fixed leverage (`25x`).
+- `dynamic_leverage.liquidation_buffer_ratio`: Safety cushion multiplier relative to stop loss ($\ge 1.5\times$ to $2.5\times$).
 - `daily_limits.max_daily_loss_pct`: Portfolio daily loss limit (`0.03` = 3%).
 
 ---
@@ -255,7 +297,7 @@ nano .env  # or vim, code, etc.
 The bot can be executed directly via the installed `crypto-scalper` command, `python -m src.main`, or the bundled `./run_bot.sh` helper.
 
 ### 1. Paper Simulation Mode (Safe Default)
-Runs the complete trading engine, streaming real-time Delta market data and simulating execution with virtual capital:
+Runs the complete trading engine, streaming real-time Delta market data, synthesizing multi-timeframe candles, and simulating execution with virtual capital:
 ```bash
 # Using CLI binary
 crypto-scalper --mode paper --paper-balance 10000
@@ -264,27 +306,21 @@ crypto-scalper --mode paper --paper-balance 10000
 ./run_bot.sh paper
 ```
 
-### 2. Market Scanner Mode
-Executes a one-shot multi-timeframe scan across all target assets, evaluates ICT market structure, runs Jev AI audits, and displays the top actionable setups:
+### 2. Parallel Market Scanner Mode
+Executes a high-throughput parallel scan across all target assets via asynchronous `AssetWorker` instances, evaluates CVD/VWAP/Squeeze confluence, runs Jev AI audits, and displays the top actionable setups:
 ```bash
-# Scan default top 10 assets
+# Scan default top 10 assets concurrently
 crypto-scalper --mode scan
 
-# Scan specific custom assets
+# Scan specific custom assets in parallel
 crypto-scalper --mode scan --symbols BTCUSD,ETHUSD,SOLUSD,XAUTUSD
 
 # Scan a preset universe
-crypto-scalper --mode scan --universe gold
+crypto-scalper --mode scan --universe top10
 ```
 
-### 3. Intraday Session Swing Mode
-Launches the bot with the 1H–8H holding horizon, 4H/1D macro bias, and 1-hour thesis immunity window:
-```bash
-crypto-scalper --mode paper --profile intraday_swing --symbols BTCUSD,ETHUSD
-```
-
-### 4. Live Trading Mode (REAL MONEY)
-Executes real orders on Delta Exchange India. Requires `LIVE_TRADING=true` in `.env` and an interactive confirmation prompt:
+### 3. Live Trading Mode (REAL MONEY)
+Executes real orders on Delta Exchange India with fixed 25x leverage and bracket stops. Requires `LIVE_TRADING=true` in `.env` and an interactive confirmation prompt:
 ```bash
 crypto-scalper --mode live
 
@@ -292,7 +328,7 @@ crypto-scalper --mode live
 crypto-scalper --mode live --yes
 ```
 
-### 5. Account Status & Connectivity Check
+### 4. Account Status & Connectivity Check
 Verifies exchange REST credentials, WebSocket connection, account equity, and margin balance:
 ```bash
 crypto-scalper --mode status
@@ -300,7 +336,7 @@ crypto-scalper --mode status
 ./run_bot.sh status
 ```
 
-### 6. Emergency Kill Switch
+### 5. Emergency Kill Switch
 Immediately cancels all resting orders and closes open positions:
 ```bash
 crypto-scalper --kill-switch
@@ -311,7 +347,6 @@ crypto-scalper --kill-switch
 ### Complete CLI Options
 ```
 usage: crypto-scalper [-h] [--mode {paper,live,scan,status,backtest}]
-                      [--profile {scalp,intraday_swing}]
                       [--config-dir CONFIG_DIR] [--log-level {DEBUG,INFO,WARNING,ERROR}]
                       [--kill-switch] [--paper-balance PAPER_BALANCE]
                       [--universe UNIVERSE] [--symbols SYMBOLS] [-y]
@@ -320,8 +355,6 @@ Options:
   -h, --help            Show help message and exit
   --mode {paper,live,scan,status,backtest}
                         Operating mode (default: paper)
-  --profile {scalp,intraday_swing}
-                        Strategy profile to execute (default: scalp)
   --config-dir CONFIG_DIR
                         Path to config directory (default: config/)
   --log-level {DEBUG,INFO,WARNING,ERROR}

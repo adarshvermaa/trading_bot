@@ -29,11 +29,19 @@ assets:
       - XAUTUSD
       - PAXGUSD
 
-
 timeframes:
-  - "15m"
-  - "5m"
+  - "5s"
+  - "15s"
+  - "30s"
   - "1m"
+  - "3m"
+  - "5m"
+  - "15m"
+  - "30m"
+  - "45m"
+  - "1h"
+  - "4h"
+  - "1d"
 
 indicators:
   ema_fast: 20
@@ -44,6 +52,11 @@ indicators:
   adx_threshold: 25
   relative_volume_period: 20
   relative_volume_threshold: 1.5
+  cvd_period: 20
+  vwap_stds: [1.0, 2.0, 3.0]
+  squeeze_bb_mult: 2.0
+  squeeze_kc_mult: 1.5
+  ofi_threshold: 0.25
 
 structure:
   min_swing_lookback: 10
@@ -67,6 +80,12 @@ scanner:
     regime: 0.20
     indicators: 0.25
     ml_confidence: 0.20
+
+parallel_scanner:
+  enabled: true
+  max_concurrent_workers: 10
+  worker_timeout_seconds: 3.0
+  enable_parallel_indicators: true
 
 execution:
   order_type: "market"              # "market" for instant fills or "limit" for maker orders
@@ -101,9 +120,7 @@ jev:
   enable_mistake_forensics: true    # Diagnose stopped-out trades and log to patterns.db
   enable_dynamic_sl_tp: true        # Enable Jev AI dynamic SL and TP resolution
   enable_dynamic_trailing: true     # Enable Jev AI dynamic trailing stop loss
-  min_risk_reward_ratio: 2.0        # Minimum allowable mathematical Risk:Reward ratio
+  min_risk_reward_ratio: 1.8        # Minimum allowable mathematical Risk:Reward ratio
   target_risk_reward_ratio: 2.5     # Default institutional target Risk:Reward ratio
-  max_risk_reward_ratio: 5.0        # Maximum expansion ceiling for runners
+  max_risk_reward_ratio: 3.5        # Maximum expansion ceiling for runners
   trailing_interval_seconds: 5      # Seconds between dynamic trailing checks
-
-
